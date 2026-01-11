@@ -205,6 +205,18 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub encoder_threads: usize,
+    /// Max number of processed messages to batch before broadcast
+    #[serde(
+        default = "ConfigGrpc::default_processed_messages_max",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub processed_messages_max: usize,
+    /// Flush interval for processed message batches
+    #[serde(
+        default = "ConfigGrpc::default_processed_messages_flush_interval",
+        with = "humantime_serde"
+    )]
+    pub processed_messages_flush_interval: Duration,
     #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
@@ -256,6 +268,14 @@ impl ConfigGrpc {
 
     const fn encoder_threads_default() -> usize {
         4
+    }
+
+    const fn default_processed_messages_max() -> usize {
+        31
+    }
+
+    const fn default_processed_messages_flush_interval() -> Duration {
+        Duration::from_millis(10)
     }
 }
 
