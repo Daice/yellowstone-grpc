@@ -34,6 +34,7 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
+    tx_filter_gate: TransactionFilterGate,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
 }
@@ -140,6 +141,7 @@ impl GeyserPlugin for Plugin {
             snapshot_channel: Mutex::new(snapshot_channel),
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
+            tx_filter_gate,
             plugin_cancellation_token,
             plugin_task_tracker,
         });
@@ -243,6 +245,12 @@ impl GeyserPlugin for Plugin {
                 }
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
             };
+
+            if !inner.tx_filter_gate.allows(transaction) {
+                metrics::tx_early_filter_drop_inc();
+                return Ok(());
+            }
+            metrics::tx_early_filter_pass_inc();
 
             let message = Message::Transaction(MessageTransaction::from_geyser(transaction, slot));
             inner.send_message(message);

@@ -4,4 +4,7 @@ pub mod limits;
 pub mod message;
 pub mod name;
 
-pub use filter::{Filter, FilterAccountsDataSlice, FilterError, FilterResult};
+pub use filter::{
+    Filter, FilterAccountsDataSlice, FilterError, FilterResult, TransactionFilterGate,
+    TransactionFilterRule,
+};
