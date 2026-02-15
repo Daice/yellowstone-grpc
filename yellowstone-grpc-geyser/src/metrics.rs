@@ -17,7 +17,8 @@ use {
     },
     log::{debug, error, info},
     prometheus::{
-        Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+        Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+        TextEncoder,
     },
     solana_clock::Slot,
     std::{
@@ -133,6 +134,16 @@ lazy_static::lazy_static! {
             "Size of processed message batches"
         )
         .buckets(vec![1.0, 4.0, 8.0, 16.0, 24.0, 31.0])
+    ).unwrap();
+
+    static ref TX_EARLY_FILTER_PASS_TOTAL: IntCounter = IntCounter::new(
+        "tx_early_filter_pass_total",
+        "Number of transactions passed by early transaction filter"
+    ).unwrap();
+
+    static ref TX_EARLY_FILTER_DROP_TOTAL: IntCounter = IntCounter::new(
+        "tx_early_filter_drop_total",
+        "Number of transactions dropped by early transaction filter"
     ).unwrap();
 }
 
@@ -287,6 +298,8 @@ impl PrometheusService {
             register!(GRPC_SUBSCRIBER_QUEUE_SIZE);
             register!(GEYSER_BATCH_SIZE);
             register!(GRPC_CLIENT_DISCONNECTS);
+            register!(TX_EARLY_FILTER_PASS_TOTAL);
+            register!(TX_EARLY_FILTER_DROP_TOTAL);
 
             VERSION
                 .with_label_values(&[
@@ -505,6 +518,14 @@ pub fn incr_client_disconnect<S: AsRef<str>>(subscriber_id: S, reason: &str) {
         .inc();
 }
 
+pub fn tx_early_filter_pass_inc() {
+    TX_EARLY_FILTER_PASS_TOTAL.inc();
+}
+
+pub fn tx_early_filter_drop_inc() {
+    TX_EARLY_FILTER_DROP_TOTAL.inc();
+}
+
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
 pub fn reset_metrics() {
     // Reset gauge metrics to 0
@@ -525,6 +546,8 @@ pub fn reset_metrics() {
     GRPC_MESSAGE_SENT.reset();
     GRPC_BYTES_SENT.reset();
     GRPC_CLIENT_DISCONNECTS.reset();
+    TX_EARLY_FILTER_PASS_TOTAL.reset();
+    TX_EARLY_FILTER_DROP_TOTAL.reset();
 
     // Note: VERSION and GEYSER_ACCOUNT_UPDATE_RECEIVED are intentionally not reset
     // - VERSION contains build info set once on startup

@@ -4,9 +4,12 @@ use {
         grpc::GrpcService,
         metrics::{self, PrometheusService},
         parallel::ParallelEncoder,
-        plugin::message::{
-            Message, MessageAccount, MessageBlockMeta, MessageEntry, MessageSlot,
-            MessageTransaction,
+        plugin::{
+            filter::TransactionFilterGate,
+            message::{
+                Message, MessageAccount, MessageBlockMeta, MessageEntry, MessageSlot,
+                MessageTransaction,
+            },
         },
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -35,6 +38,7 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
+    tx_filter_gate: TransactionFilterGate,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     encoder_handle: std::thread::JoinHandle<()>,
@@ -110,6 +114,8 @@ impl GeyserPlugin for Plugin {
 
         let encoder_threads = config.grpc.encoder_threads;
         let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
+        let tx_filter_gate = TransactionFilterGate::default();
+        let tx_filter_gate_for_grpc = tx_filter_gate.clone();
 
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
@@ -130,6 +136,7 @@ impl GeyserPlugin for Plugin {
                 grpc_cancellation_token,
                 grpc_task_tracker,
                 encoder,
+                tx_filter_gate_for_grpc,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
@@ -152,6 +159,7 @@ impl GeyserPlugin for Plugin {
             snapshot_channel: Mutex::new(snapshot_channel),
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
+            tx_filter_gate,
             plugin_cancellation_token,
             plugin_task_tracker,
             encoder_handle,
@@ -260,6 +268,12 @@ impl GeyserPlugin for Plugin {
                 }
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
             };
+
+            if !inner.tx_filter_gate.allows(transaction) {
+                metrics::tx_early_filter_drop_inc();
+                return Ok(());
+            }
+            metrics::tx_early_filter_pass_inc();
 
             let message = Message::Transaction(MessageTransaction::from_geyser(transaction, slot));
             inner.send_message(message);

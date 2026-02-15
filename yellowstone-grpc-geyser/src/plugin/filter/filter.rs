@@ -17,6 +17,7 @@ use {
             MessageSlot, MessageTransaction, SlotStatus,
         },
     },
+    agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoV3,
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
     bytes::buf::BufMut,
     prost::encoding::{encode_key, encode_varint, WireType},
@@ -29,7 +30,7 @@ use {
         collections::{HashMap, HashSet},
         ops::Range,
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, RwLock},
     },
     yellowstone_grpc_proto::geyser::{
         subscribe_request_filter_accounts_filter::Filter as AccountsFilterDataOneof,
@@ -108,6 +109,177 @@ pub struct Filter {
     commitment: CommitmentLevel,
     accounts_data_slice: FilterAccountsDataSlice,
     ping: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransactionFilterRule {
+    pub vote: Option<bool>,
+    pub failed: Option<bool>,
+    pub signature: Option<Signature>,
+    pub account_include: Vec<Pubkey>,
+    pub account_exclude: Vec<Pubkey>,
+    pub account_required: Vec<Pubkey>,
+}
+
+impl TransactionFilterRule {
+    fn from_inner(inner: &FilterTransactionsInner) -> Self {
+        Self {
+            vote: inner.vote,
+            failed: inner.failed,
+            signature: inner.signature.clone(),
+            account_include: inner.account_include.iter().copied().collect(),
+            account_exclude: inner.account_exclude.iter().copied().collect(),
+            account_required: inner.account_required.iter().copied().collect(),
+        }
+    }
+
+    fn contains_account(tx_info: &ReplicaTransactionInfoV3<'_>, pubkey: &Pubkey) -> bool {
+        tx_info
+            .transaction
+            .message
+            .static_account_keys()
+            .iter()
+            .chain(
+                tx_info
+                    .transaction_status_meta
+                    .loaded_addresses
+                    .writable
+                    .iter(),
+            )
+            .chain(
+                tx_info
+                    .transaction_status_meta
+                    .loaded_addresses
+                    .readonly
+                    .iter(),
+            )
+            .any(|key| key == pubkey)
+    }
+
+    pub fn matches_geyser(&self, tx_info: &ReplicaTransactionInfoV3<'_>) -> bool {
+        if let Some(is_vote) = self.vote {
+            if is_vote != tx_info.is_vote {
+                return false;
+            }
+        }
+
+        if let Some(is_failed) = self.failed {
+            if is_failed != tx_info.transaction_status_meta.status.is_err() {
+                return false;
+            }
+        }
+
+        if let Some(signature) = &self.signature {
+            if signature != tx_info.signature {
+                return false;
+            }
+        }
+
+        if !self.account_include.is_empty()
+            && !self
+                .account_include
+                .iter()
+                .any(|pubkey| Self::contains_account(tx_info, pubkey))
+        {
+            return false;
+        }
+
+        if !self.account_exclude.is_empty()
+            && self
+                .account_exclude
+                .iter()
+                .any(|pubkey| Self::contains_account(tx_info, pubkey))
+        {
+            return false;
+        }
+
+        if !self.account_required.is_empty()
+            && self
+                .account_required
+                .iter()
+                .any(|pubkey| !Self::contains_account(tx_info, pubkey))
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug)]
+struct TransactionFilterGateInner {
+    client_rules: HashMap<usize, Arc<[TransactionFilterRule]>>,
+    merged_rules: Arc<[TransactionFilterRule]>,
+}
+
+impl Default for TransactionFilterGateInner {
+    fn default() -> Self {
+        Self {
+            client_rules: HashMap::new(),
+            merged_rules: Vec::new().into(),
+        }
+    }
+}
+
+impl TransactionFilterGateInner {
+    fn rebuild_merged(&mut self) {
+        let total_rules = self
+            .client_rules
+            .values()
+            .map(|rules| rules.len())
+            .sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in self.client_rules.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        self.merged_rules = merged.into();
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TransactionFilterGate {
+    inner: Arc<RwLock<TransactionFilterGateInner>>,
+}
+
+impl TransactionFilterGate {
+    pub fn update_client_rules(&self, client_id: usize, rules: Vec<TransactionFilterRule>) {
+        let mut inner = match self.inner.write() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if rules.is_empty() {
+            inner.client_rules.remove(&client_id);
+        } else {
+            inner.client_rules.insert(client_id, rules.into());
+        }
+        inner.rebuild_merged();
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let mut inner = match self.inner.write() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if inner.client_rules.remove(&client_id).is_some() {
+            inner.rebuild_merged();
+        }
+    }
+
+    pub fn allows(&self, tx_info: &ReplicaTransactionInfoV3<'_>) -> bool {
+        let rules = match self.inner.read() {
+            Ok(inner) => Arc::clone(&inner.merged_rules),
+            // Fail-open on poisoned lock to avoid dropping valid updates.
+            Err(_poisoned) => return true,
+        };
+
+        if rules.is_empty() {
+            return false;
+        }
+
+        rules.iter().any(|rule| rule.matches_geyser(tx_info))
+    }
 }
 
 impl Default for Filter {
@@ -228,6 +400,15 @@ impl Filter {
 
     pub fn has_blocks_subscriptions(&self) -> bool {
         !self.blocks.filters.is_empty()
+    }
+
+    pub fn get_transaction_filter_rules(&self) -> Vec<TransactionFilterRule> {
+        let mut rules = Vec::with_capacity(
+            self.transactions.filters.len() + self.transactions_status.filters.len(),
+        );
+        self.transactions.collect_rules(&mut rules);
+        self.transactions_status.collect_rules(&mut rules);
+        rules
     }
 
     pub const fn get_commitment_level(&self) -> CommitmentLevel {
@@ -748,6 +929,10 @@ impl FilterTransactions {
             filter_type,
             filters,
         })
+    }
+
+    fn collect_rules(&self, rules: &mut Vec<TransactionFilterRule>) {
+        rules.extend(self.filters.values().map(TransactionFilterRule::from_inner));
     }
 
     pub fn get_updates(&self, message: &MessageTransaction) -> FilteredUpdates {
