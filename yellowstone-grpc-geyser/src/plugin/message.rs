@@ -199,12 +199,22 @@ pub struct MessageAccountInfo {
 
 impl MessageAccountInfo {
     pub fn from_geyser(info: &ReplicaAccountInfoV3<'_>) -> Self {
+        let pubkey = Pubkey::try_from(info.pubkey).expect("valid Pubkey");
+        let owner = Pubkey::try_from(info.owner).expect("valid Pubkey");
+        Self::from_geyser_with_keys(info, pubkey, owner)
+    }
+
+    pub fn from_geyser_with_keys(
+        info: &ReplicaAccountInfoV3<'_>,
+        pubkey: Pubkey,
+        owner: Pubkey,
+    ) -> Self {
         let shared = info.data.to_vec();
         let data = Bytes::from(shared);
         Self {
-            pubkey: Pubkey::try_from(info.pubkey).expect("valid Pubkey"),
+            pubkey,
             lamports: info.lamports,
-            owner: Pubkey::try_from(info.owner).expect("valid Pubkey"),
+            owner,
             executable: info.executable,
             rent_epoch: info.rent_epoch,
             data,
@@ -248,8 +258,22 @@ pub struct MessageAccount {
 
 impl MessageAccount {
     pub fn from_geyser(info: &ReplicaAccountInfoV3<'_>, slot: Slot, is_startup: bool) -> Self {
+        let pubkey = Pubkey::try_from(info.pubkey).expect("valid Pubkey");
+        let owner = Pubkey::try_from(info.owner).expect("valid Pubkey");
+        Self::from_geyser_with_keys(info, slot, is_startup, pubkey, owner)
+    }
+
+    pub fn from_geyser_with_keys(
+        info: &ReplicaAccountInfoV3<'_>,
+        slot: Slot,
+        is_startup: bool,
+        pubkey: Pubkey,
+        owner: Pubkey,
+    ) -> Self {
         Self {
-            account: Arc::new(MessageAccountInfo::from_geyser(info)),
+            account: Arc::new(MessageAccountInfo::from_geyser_with_keys(
+                info, pubkey, owner,
+            )),
             slot,
             is_startup,
             created_at: Timestamp::from(SystemTime::now()),
@@ -283,9 +307,8 @@ pub struct MessageTransactionInfo {
 }
 
 impl MessageTransactionInfo {
-    pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>) -> Self {
-        let account_keys: HashSet<Pubkey> = info
-            .transaction
+    fn collect_account_keys(info: &ReplicaTransactionInfoV3<'_>) -> HashSet<Pubkey> {
+        info.transaction
             .message
             .static_account_keys() // Since V3, dynamic account are only available in `loaded_addresses`
             .iter()
@@ -302,8 +325,18 @@ impl MessageTransactionInfo {
                     .iter(),
             )
             .copied()
-            .collect();
+            .collect()
+    }
 
+    pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>) -> Self {
+        let account_keys = Self::collect_account_keys(info);
+        Self::from_geyser_with_account_keys(info, account_keys)
+    }
+
+    pub fn from_geyser_with_account_keys(
+        info: &ReplicaTransactionInfoV3<'_>,
+        account_keys: HashSet<Pubkey>,
+    ) -> Self {
         Self {
             signature: *info.signature,
             is_vote: info.is_vote,
@@ -376,8 +409,20 @@ pub struct MessageTransaction {
 
 impl MessageTransaction {
     pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>, slot: Slot) -> Self {
+        let account_keys = MessageTransactionInfo::collect_account_keys(info);
+        Self::from_geyser_with_account_keys(info, slot, account_keys)
+    }
+
+    pub fn from_geyser_with_account_keys(
+        info: &ReplicaTransactionInfoV3<'_>,
+        slot: Slot,
+        account_keys: HashSet<Pubkey>,
+    ) -> Self {
         Self {
-            transaction: Arc::new(MessageTransactionInfo::from_geyser(info)),
+            transaction: Arc::new(MessageTransactionInfo::from_geyser_with_account_keys(
+                info,
+                account_keys,
+            )),
             slot,
             created_at: Timestamp::from(SystemTime::now()),
         }

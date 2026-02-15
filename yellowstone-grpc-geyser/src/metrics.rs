@@ -145,6 +145,16 @@ lazy_static::lazy_static! {
         "tx_early_filter_drop_total",
         "Number of transactions dropped by early transaction filter"
     ).unwrap();
+
+    static ref ACCOUNT_EARLY_FILTER_PASS_TOTAL: IntCounter = IntCounter::new(
+        "account_early_filter_pass_total",
+        "Number of accounts passed by early account filter"
+    ).unwrap();
+
+    static ref ACCOUNT_EARLY_FILTER_DROP_TOTAL: IntCounter = IntCounter::new(
+        "account_early_filter_drop_total",
+        "Number of accounts dropped by early account filter"
+    ).unwrap();
 }
 
 #[derive(Debug)]
@@ -300,6 +310,8 @@ impl PrometheusService {
             register!(GRPC_CLIENT_DISCONNECTS);
             register!(TX_EARLY_FILTER_PASS_TOTAL);
             register!(TX_EARLY_FILTER_DROP_TOTAL);
+            register!(ACCOUNT_EARLY_FILTER_PASS_TOTAL);
+            register!(ACCOUNT_EARLY_FILTER_DROP_TOTAL);
 
             VERSION
                 .with_label_values(&[
@@ -526,6 +538,14 @@ pub fn tx_early_filter_drop_inc() {
     TX_EARLY_FILTER_DROP_TOTAL.inc();
 }
 
+pub fn account_early_filter_pass_inc() {
+    ACCOUNT_EARLY_FILTER_PASS_TOTAL.inc();
+}
+
+pub fn account_early_filter_drop_inc() {
+    ACCOUNT_EARLY_FILTER_DROP_TOTAL.inc();
+}
+
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
 pub fn reset_metrics() {
     // Reset gauge metrics to 0
@@ -548,6 +568,8 @@ pub fn reset_metrics() {
     GRPC_CLIENT_DISCONNECTS.reset();
     TX_EARLY_FILTER_PASS_TOTAL.reset();
     TX_EARLY_FILTER_DROP_TOTAL.reset();
+    ACCOUNT_EARLY_FILTER_PASS_TOTAL.reset();
+    ACCOUNT_EARLY_FILTER_DROP_TOTAL.reset();
 
     // Note: VERSION and GEYSER_ACCOUNT_UPDATE_RECEIVED are intentionally not reset
     // - VERSION contains build info set once on startup

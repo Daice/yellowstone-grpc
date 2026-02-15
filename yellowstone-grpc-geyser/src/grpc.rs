@@ -11,7 +11,7 @@ use {
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateOneof},
                 name::FilterNames,
-                Filter, TransactionFilterGate,
+                AccountFilterGate, Filter, TransactionFilterGate,
             },
             message::{
                 CommitmentLevel, Message, MessageBlock, MessageBlockMeta, MessageEntry,
@@ -403,6 +403,7 @@ pub struct GrpcService {
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     active_blocks_subscriptions: Arc<AtomicUsize>,
+    account_filter_gate: AccountFilterGate,
     tx_filter_gate: TransactionFilterGate,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
@@ -419,6 +420,7 @@ impl GrpcService {
         service_cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
         parallel_encoder: ParallelEncoder,
+        account_filter_gate: AccountFilterGate,
         tx_filter_gate: TransactionFilterGate,
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
@@ -510,6 +512,7 @@ impl GrpcService {
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
             active_blocks_subscriptions: Arc::clone(&active_blocks_subscriptions),
+            account_filter_gate,
             tx_filter_gate,
             debug_clients_tx,
             filter_names,
@@ -929,6 +932,7 @@ impl GrpcService {
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         active_blocks_subscriptions: Arc<AtomicUsize>,
+        account_filter_gate: AccountFilterGate,
         tx_filter_gate: TransactionFilterGate,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
@@ -960,6 +964,12 @@ impl GrpcService {
                 tx_filter_gate.remove_client(id);
             }
         });
+        let _account_filter_on_drop = OnDrop::new({
+            let account_filter_gate = account_filter_gate.clone();
+            move || {
+                account_filter_gate.remove_client(id);
+            }
+        });
 
         metrics::update_subscriptions(&endpoint, None, Some(&filter));
         let subscriber_id = subscriber_id.unwrap_or("UNKNOWN".to_owned());
@@ -981,6 +991,7 @@ impl GrpcService {
                 &mut filter,
                 &active_blocks_subscriptions,
                 &has_blocks_subscription,
+                &account_filter_gate,
                 &tx_filter_gate,
                 cancellation_token.clone(),
             )
@@ -1048,6 +1059,8 @@ impl GrpcService {
                                 &has_blocks_subscription,
                                 &filter_new,
                             );
+                            account_filter_gate
+                                .update_client_rules(id, filter_new.get_account_filter_rules());
                             tx_filter_gate
                                 .update_client_rules(id, filter_new.get_transaction_filter_rules());
                             metrics::update_subscriptions(&endpoint, Some(&filter), Some(&filter_new));
@@ -1200,6 +1213,7 @@ impl GrpcService {
         filter: &mut Filter,
         active_blocks_subscriptions: &Arc<AtomicUsize>,
         has_blocks_subscription: &Arc<AtomicBool>,
+        account_filter_gate: &AccountFilterGate,
         tx_filter_gate: &TransactionFilterGate,
         cancellation_token: CancellationToken,
     ) -> Result<(), ClientSnapshotReplayError> {
@@ -1228,6 +1242,8 @@ impl GrpcService {
                                 has_blocks_subscription,
                                 &filter_new,
                             );
+                            account_filter_gate
+                                .update_client_rules(id, filter_new.get_account_filter_rules());
                             tx_filter_gate
                                 .update_client_rules(id, filter_new.get_transaction_filter_rules());
                             metrics::update_subscriptions(endpoint, Some(filter), Some(&filter_new));
@@ -1421,6 +1437,7 @@ impl Geyser for GrpcService {
             self.replay_stored_slots_tx.clone(),
             self.debug_clients_tx.clone(),
             Arc::clone(&self.active_blocks_subscriptions),
+            self.account_filter_gate.clone(),
             self.tx_filter_gate.clone(),
             client_cancellation_token,
             self.task_tracker.clone(),
