@@ -37,7 +37,7 @@ use {
     std::{
         collections::{BTreeMap, HashMap},
         sync::{
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc,
         },
         time::SystemTime,
@@ -402,6 +402,7 @@ pub struct GrpcService {
     broadcast_tx: broadcast::Sender<BroadcastedMessage>,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
+    active_blocks_subscriptions: Arc<AtomicUsize>,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
     cancellation_token: CancellationToken,
@@ -449,6 +450,7 @@ impl GrpcService {
 
         // Messages to clients combined by commitment
         let (broadcast_tx, _) = broadcast::channel(config.channel_capacity);
+        let active_blocks_subscriptions = Arc::new(AtomicUsize::new(0));
         // attempt to prevent spam of geyser loop with capacity eq 1
         let (replay_first_available_slot, replay_stored_slots_tx, replay_stored_slots_rx) =
             if config.replay_stored_slots == 0 {
@@ -505,6 +507,7 @@ impl GrpcService {
             broadcast_tx: broadcast_tx.clone(),
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
+            active_blocks_subscriptions: Arc::clone(&active_blocks_subscriptions),
             debug_clients_tx,
             filter_names,
             cancellation_token: service_cancellation_token.clone(),
@@ -525,6 +528,7 @@ impl GrpcService {
                 messages_rx,
                 blocks_meta_tx,
                 broadcast_tx,
+                active_blocks_subscriptions,
                 replay_stored_slots_rx,
                 replay_first_available_slot,
                 config.replay_stored_slots,
@@ -569,6 +573,7 @@ impl GrpcService {
         mut messages_rx: mpsc::UnboundedReceiver<Message>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        active_blocks_subscriptions: Arc<AtomicUsize>,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
@@ -600,6 +605,8 @@ impl GrpcService {
                     };
                     metrics::message_queue_size_dec();
                     let msgid = msgid_gen.next();
+                    let reconstruct_blocks =
+                        active_blocks_subscriptions.load(Ordering::Relaxed) > 0;
 
                     // Update metrics
                     if let Message::Slot(slot_message) = &message {
@@ -633,7 +640,15 @@ impl GrpcService {
                                                     _ => {}
                                                 }
 
-                                                if !slot_messages.sealed && slot_messages.finalized_at.is_some() {
+                                                let has_reconstruction_state = slot_messages
+                                                    .block_meta
+                                                    .is_some()
+                                                    || !slot_messages.transactions.is_empty()
+                                                    || !slot_messages.entries.is_empty();
+                                                if has_reconstruction_state
+                                                    && !slot_messages.sealed
+                                                    && slot_messages.finalized_at.is_some()
+                                                {
                                                     let mut reasons = vec![];
                                                     if let Some(block_meta) = slot_messages.block_meta {
                                                         let block_txn_count = block_meta.executed_transaction_count as usize;
@@ -707,15 +722,21 @@ impl GrpcService {
                     let mut sealed_block_msg = None;
                     match &message {
                         Message::BlockMeta(msg) => {
-                            if slot_messages.block_meta.is_some() {
-                                metrics::update_invalid_blocks("unexpected message: BlockMeta (duplicate)");
+                            if reconstruct_blocks {
+                                if slot_messages.block_meta.is_some() {
+                                    metrics::update_invalid_blocks(
+                                        "unexpected message: BlockMeta (duplicate)",
+                                    );
+                                }
+                                slot_messages.block_meta = Some(Arc::clone(msg));
+                                sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
                             }
-                            slot_messages.block_meta = Some(Arc::clone(msg));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
                         }
                         Message::Transaction(msg) => {
-                            slot_messages.transactions.push(Arc::clone(&msg.transaction));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
+                            if reconstruct_blocks {
+                                slot_messages.transactions.push(Arc::clone(&msg.transaction));
+                                sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
+                            }
                         }
                         // Dedup accounts by max write_version
                         Message::Account(msg) => {
@@ -737,8 +758,10 @@ impl GrpcService {
                             }
                         }
                         Message::Entry(msg) => {
-                            slot_messages.entries.push(Arc::clone(msg));
-                            sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
+                            if reconstruct_blocks {
+                                slot_messages.entries.push(Arc::clone(msg));
+                                sealed_block_msg = slot_messages.try_seal(&mut msgid_gen);
+                            }
                         }
                         _ => {}
                     }
@@ -789,40 +812,32 @@ impl GrpcService {
 
                     for message in messages_vec.into_iter().rev() {
                         if let Message::Slot(slot) = &message.1 {
-                            let (mut confirmed_messages, mut finalized_messages) = match slot.status {
-                                SlotStatus::Processed | SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::CreatedBank | SlotStatus::Dead => {
-                                    (Vec::with_capacity(1), Vec::with_capacity(1))
-                                }
+                            match slot.status {
                                 SlotStatus::Confirmed => {
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
-                                            slot_messages.confirmed_at = Some(slot_messages.messages.len());
+                                            slot_messages.confirmed_at =
+                                                Some(slot_messages.messages.len());
                                         }
                                     }
-
-                                    let vec = messages
-                                        .get(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (vec, Vec::with_capacity(1))
                                 }
                                 SlotStatus::Finalized => {
                                     if let Some(slot_messages) = messages.get_mut(&slot.slot) {
                                         if !slot_messages.sealed {
-                                            slot_messages.finalized_at = Some(slot_messages.messages.len());
+                                            slot_messages.finalized_at =
+                                                Some(slot_messages.messages.len());
                                         }
                                     }
-
-                                    let vec = messages
-                                        .get_mut(&slot.slot)
-                                        .map(|slot_messages| slot_messages.messages.iter().flatten().cloned().collect())
-                                        .unwrap_or_default();
-                                    (Vec::with_capacity(1), vec)
                                 }
-                            };
+                                SlotStatus::Processed
+                                | SlotStatus::FirstShredReceived
+                                | SlotStatus::Completed
+                                | SlotStatus::CreatedBank
+                                | SlotStatus::Dead => {}
+                            }
 
                             // processed
-                            processed_messages.push(message.clone());
+                            processed_messages.push(message);
                             GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                             let _ =
                                 broadcast_tx.send((CommitmentLevel::Processed, processed_messages.into()));
@@ -830,39 +845,9 @@ impl GrpcService {
                             processed_sleep
                                 .as_mut()
                                 .reset(Instant::now() + processed_messages_flush_interval);
-
-                            // confirmed
-                            confirmed_messages.push(message.clone());
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-
-                            // finalized
-                            finalized_messages.push(message);
-                            let _ =
-                                broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
                         } else {
-                            let mut confirmed_messages = vec![];
-                            let mut finalized_messages = vec![];
-                            if matches!(&message.1, Message::Block(_)) {
-                                if let Some(slot_messages) = messages.get(&message.1.get_slot()) {
-                                    if let Some(confirmed_at) = slot_messages.confirmed_at {
-                                        confirmed_messages.extend(
-                                            slot_messages.messages.as_slice()[confirmed_at..].iter().filter_map(|x| x.clone())
-                                        );
-                                    }
-                                    if let Some(finalized_at) = slot_messages.finalized_at {
-                                        finalized_messages.extend(
-                                            slot_messages.messages.as_slice()[finalized_at..].iter().filter_map(|x| x.clone())
-                                        );
-                                    }
-                                }
-                            }
-
                             processed_messages.push(message);
-                            if processed_messages.len() >= processed_messages_max
-                                || !confirmed_messages.is_empty()
-                                || !finalized_messages.is_empty()
-                            {
+                            if processed_messages.len() >= processed_messages_max {
                                 GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
                                 let _ = broadcast_tx
                                     .send((CommitmentLevel::Processed, processed_messages.into()));
@@ -870,16 +855,6 @@ impl GrpcService {
                                 processed_sleep
                                     .as_mut()
                                     .reset(Instant::now() + processed_messages_flush_interval);
-                            }
-
-                            if !confirmed_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Confirmed, confirmed_messages.into()));
-                            }
-
-                            if !finalized_messages.is_empty() {
-                                let _ =
-                                    broadcast_tx.send((CommitmentLevel::Finalized, finalized_messages.into()));
                             }
                         }
                     }
@@ -924,6 +899,21 @@ impl GrpcService {
         info!("Geyser loop exiting");
     }
 
+    fn sync_blocks_subscriptions(
+        active_blocks_subscriptions: &Arc<AtomicUsize>,
+        has_blocks_subscription: &Arc<AtomicBool>,
+        filter: &Filter,
+    ) {
+        let has_blocks_subscription_new = filter.has_blocks_subscriptions();
+        let has_blocks_subscription_old =
+            has_blocks_subscription.swap(has_blocks_subscription_new, Ordering::Relaxed);
+        if !has_blocks_subscription_old && has_blocks_subscription_new {
+            active_blocks_subscriptions.fetch_add(1, Ordering::Relaxed);
+        } else if has_blocks_subscription_old && !has_blocks_subscription_new {
+            active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn client_loop(
         id: usize,
@@ -935,16 +925,28 @@ impl GrpcService {
         mut messages_rx: broadcast::Receiver<BroadcastedMessage>,
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
+        active_blocks_subscriptions: Arc<AtomicUsize>,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
     ) {
         let mut filter = Filter::default();
+        let has_blocks_subscription = Arc::new(AtomicBool::new(false));
 
         // Ensure cancellation_token is cancelled on exit even if we panic
         let on_drop = OnDrop::new({
             let cancellation_token = cancellation_token.clone();
             move || {
                 cancellation_token.cancel();
+            }
+        });
+        // Ensure blocks subscription counter is decremented on all exit paths.
+        let _blocks_subscriptions_on_drop = OnDrop::new({
+            let active_blocks_subscriptions = Arc::clone(&active_blocks_subscriptions);
+            let has_blocks_subscription = Arc::clone(&has_blocks_subscription);
+            move || {
+                if has_blocks_subscription.swap(false, Ordering::Relaxed) {
+                    active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
+                }
             }
         });
 
@@ -966,6 +968,8 @@ impl GrpcService {
                 &mut client_rx,
                 snapshot_rx,
                 &mut filter,
+                &active_blocks_subscriptions,
+                &has_blocks_subscription,
                 cancellation_token.clone(),
             )
             .await;
@@ -1027,6 +1031,11 @@ impl GrpcService {
 
                     match message {
                         Some(Some((from_slot, filter_new))) => {
+                            Self::sync_blocks_subscriptions(
+                                &active_blocks_subscriptions,
+                                &has_blocks_subscription,
+                                &filter_new,
+                            );
                             metrics::update_subscriptions(&endpoint, Some(&filter), Some(&filter_new));
                             filter = filter_new;
                             DebugClientMessage::maybe_send(&debug_client_tx, || DebugClientMessage::UpdateFilter { id, filter: Box::new(filter.clone()) });
@@ -1175,6 +1184,8 @@ impl GrpcService {
         client_rx: &mut mpsc::UnboundedReceiver<Option<(Option<u64>, Filter)>>,
         snapshot_rx: crossbeam_channel::Receiver<Box<Message>>,
         filter: &mut Filter,
+        active_blocks_subscriptions: &Arc<AtomicUsize>,
+        has_blocks_subscription: &Arc<AtomicBool>,
         cancellation_token: CancellationToken,
     ) -> Result<(), ClientSnapshotReplayError> {
         info!("client #{id}: going to receive snapshot data");
@@ -1197,6 +1208,11 @@ impl GrpcService {
                                 continue;
                             }
 
+                            Self::sync_blocks_subscriptions(
+                                active_blocks_subscriptions,
+                                has_blocks_subscription,
+                                &filter_new,
+                            );
                             metrics::update_subscriptions(endpoint, Some(filter), Some(&filter_new));
                             *filter = filter_new;
                             info!("client #{id}: filter updated");
@@ -1387,6 +1403,7 @@ impl Geyser for GrpcService {
             self.broadcast_tx.subscribe(),
             self.replay_stored_slots_tx.clone(),
             self.debug_clients_tx.clone(),
+            Arc::clone(&self.active_blocks_subscriptions),
             client_cancellation_token,
             self.task_tracker.clone(),
         ));
