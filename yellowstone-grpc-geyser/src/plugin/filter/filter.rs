@@ -157,7 +157,7 @@ impl Default for AccountFilterGateInner {
 }
 
 impl AccountFilterGateInner {
-    fn build_merged(&self) -> Arc<[AccountFilterRule]> {
+    fn build_merged(&self) -> Arc<Vec<AccountFilterRule>> {
         let total_rules = self
             .client_rules
             .values()
@@ -167,21 +167,21 @@ impl AccountFilterGateInner {
         for rules in self.client_rules.values() {
             merged.extend(rules.iter().cloned());
         }
-        merged.into()
+        Arc::new(merged)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct AccountFilterGate {
     inner: Arc<RwLock<AccountFilterGateInner>>,
-    merged_rules: Arc<ArcSwap<[AccountFilterRule]>>,
+    merged_rules: Arc<ArcSwap<Vec<AccountFilterRule>>>,
 }
 
 impl Default for AccountFilterGate {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(AccountFilterGateInner::default())),
-            merged_rules: Arc::new(ArcSwap::from(Arc::<[AccountFilterRule]>::from(Vec::new()))),
+            merged_rules: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 }
@@ -340,7 +340,7 @@ impl Default for TransactionFilterGateInner {
 }
 
 impl TransactionFilterGateInner {
-    fn build_merged(&self) -> Arc<[TransactionFilterRule]> {
+    fn build_merged(&self) -> Arc<Vec<TransactionFilterRule>> {
         let total_rules = self
             .client_rules
             .values()
@@ -350,23 +350,21 @@ impl TransactionFilterGateInner {
         for rules in self.client_rules.values() {
             merged.extend(rules.iter().cloned());
         }
-        merged.into()
+        Arc::new(merged)
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct TransactionFilterGate {
     inner: Arc<RwLock<TransactionFilterGateInner>>,
-    merged_rules: Arc<ArcSwap<[TransactionFilterRule]>>,
+    merged_rules: Arc<ArcSwap<Vec<TransactionFilterRule>>>,
 }
 
 impl Default for TransactionFilterGate {
     fn default() -> Self {
         Self {
             inner: Arc::new(RwLock::new(TransactionFilterGateInner::default())),
-            merged_rules: Arc::new(ArcSwap::from(Arc::<[TransactionFilterRule]>::from(
-                Vec::new(),
-            ))),
+            merged_rules: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 }
