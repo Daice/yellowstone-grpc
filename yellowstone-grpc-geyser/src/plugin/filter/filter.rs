@@ -226,6 +226,10 @@ impl Filter {
         ]
     }
 
+    pub fn has_blocks_subscriptions(&self) -> bool {
+        !self.blocks.filters.is_empty()
+    }
+
     pub const fn get_commitment_level(&self) -> CommitmentLevel {
         self.commitment
     }
