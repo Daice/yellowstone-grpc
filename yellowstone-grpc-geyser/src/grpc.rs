@@ -10,7 +10,7 @@ use {
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateOneof},
                 name::FilterNames,
-                Filter, TransactionFilterGate,
+                AccountFilterGate, Filter, TransactionFilterGate,
             },
             message::{
                 CommitmentLevel, Message, MessageBlock, MessageBlockMeta, MessageEntry,
@@ -482,6 +482,7 @@ pub struct GrpcService {
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     active_blocks_subscriptions: Arc<AtomicUsize>,
+    account_filter_gate: AccountFilterGate,
     tx_filter_gate: TransactionFilterGate,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
@@ -594,6 +595,7 @@ impl GrpcService {
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
             active_blocks_subscriptions: Arc::clone(&active_blocks_subscriptions),
+            account_filter_gate,
             tx_filter_gate,
             debug_clients_tx,
             filter_names,
@@ -1221,6 +1223,7 @@ impl GrpcService {
         filter: &mut Filter,
         active_blocks_subscriptions: &Arc<AtomicUsize>,
         has_blocks_subscription: &Arc<AtomicBool>,
+        account_filter_gate: &AccountFilterGate,
         tx_filter_gate: &TransactionFilterGate,
         cancellation_token: CancellationToken,
     ) -> Result<(), ClientSnapshotReplayError> {
@@ -1249,6 +1252,8 @@ impl GrpcService {
                                 has_blocks_subscription,
                                 &filter_new,
                             );
+                            account_filter_gate
+                                .update_client_rules(id, filter_new.get_account_filter_rules());
                             tx_filter_gate
                                 .update_client_rules(id, filter_new.get_transaction_filter_rules());
                             metrics::update_subscriptions(endpoint, Some(filter), Some(&filter_new));

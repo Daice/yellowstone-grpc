@@ -13,6 +13,7 @@ use {
         ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
         SlotStatus,
     },
+    solana_pubkey::Pubkey,
     std::{
         concat, env,
         sync::{
@@ -34,6 +35,7 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
+    account_filter_gate: AccountFilterGate,
     tx_filter_gate: TransactionFilterGate,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
@@ -141,6 +143,7 @@ impl GeyserPlugin for Plugin {
             snapshot_channel: Mutex::new(snapshot_channel),
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
+            account_filter_gate,
             tx_filter_gate,
             plugin_cancellation_token,
             plugin_task_tracker,
@@ -200,8 +203,28 @@ impl GeyserPlugin for Plugin {
                     }
                 }
             } else {
-                let message =
-                    Message::Account(MessageAccount::from_geyser(account, slot, is_startup));
+                let Ok(pubkey) = Pubkey::try_from(account.pubkey) else {
+                    metrics::account_early_filter_drop_inc();
+                    return Ok(());
+                };
+                let Ok(owner) = Pubkey::try_from(account.owner) else {
+                    metrics::account_early_filter_drop_inc();
+                    return Ok(());
+                };
+
+                if !inner.account_filter_gate.allows_prepared(
+                    account.txn.is_some(),
+                    &pubkey,
+                    &owner,
+                ) {
+                    metrics::account_early_filter_drop_inc();
+                    return Ok(());
+                }
+                metrics::account_early_filter_pass_inc();
+
+                let message = Message::Account(MessageAccount::from_geyser_with_keys(
+                    account, slot, is_startup, pubkey, owner,
+                ));
                 inner.send_message(message);
             }
 
@@ -246,13 +269,18 @@ impl GeyserPlugin for Plugin {
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
             };
 
-            if !inner.tx_filter_gate.allows(transaction) {
+            let Some(account_keys) = inner.tx_filter_gate.allows_and_account_keys(transaction)
+            else {
                 metrics::tx_early_filter_drop_inc();
                 return Ok(());
-            }
+            };
             metrics::tx_early_filter_pass_inc();
 
-            let message = Message::Transaction(MessageTransaction::from_geyser(transaction, slot));
+            let message = Message::Transaction(MessageTransaction::from_geyser_with_account_keys(
+                transaction,
+                slot,
+                account_keys,
+            ));
             inner.send_message(message);
 
             Ok(())

@@ -564,6 +564,14 @@ pub fn remove_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(remote
         .expect("remove_label_values");
 }
 
+pub fn account_early_filter_pass_inc() {
+    ACCOUNT_EARLY_FILTER_PASS_TOTAL.inc();
+}
+
+pub fn account_early_filter_drop_inc() {
+    ACCOUNT_EARLY_FILTER_DROP_TOTAL.inc();
+}
+
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
 pub fn reset_metrics() {
     // Reset gauge metrics to 0

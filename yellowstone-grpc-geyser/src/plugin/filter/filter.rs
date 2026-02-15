@@ -17,7 +17,10 @@ use {
             MessageSlot, MessageTransaction, SlotStatus,
         },
     },
-    agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaTransactionInfoV3,
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
+        ReplicaAccountInfoV3, ReplicaTransactionInfoV3,
+    },
+    arc_swap::ArcSwap,
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
     bytes::buf::BufMut,
     prost::encoding::{encode_key, encode_varint, WireType},
@@ -112,6 +115,140 @@ pub struct Filter {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct AccountFilterRule {
+    nonempty_txn_signature: Option<bool>,
+    account: HashSet<Pubkey>,
+    account_required: bool,
+    owner: HashSet<Pubkey>,
+    owner_required: bool,
+}
+
+impl AccountFilterRule {
+    fn matches_prepared(&self, has_txn_signature: bool, pubkey: &Pubkey, owner: &Pubkey) -> bool {
+        if let Some(nonempty_txn_signature) = self.nonempty_txn_signature {
+            if nonempty_txn_signature != has_txn_signature {
+                return false;
+            }
+        }
+
+        if self.account_required && !self.account.contains(pubkey) {
+            return false;
+        }
+
+        if self.owner_required && !self.owner.contains(owner) {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug)]
+struct AccountFilterGateInner {
+    client_rules: HashMap<usize, Arc<[AccountFilterRule]>>,
+}
+
+impl Default for AccountFilterGateInner {
+    fn default() -> Self {
+        Self {
+            client_rules: HashMap::new(),
+        }
+    }
+}
+
+impl AccountFilterGateInner {
+    fn build_merged(&self) -> Arc<[AccountFilterRule]> {
+        let total_rules = self
+            .client_rules
+            .values()
+            .map(|rules| rules.len())
+            .sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in self.client_rules.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        merged.into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountFilterGate {
+    inner: Arc<RwLock<AccountFilterGateInner>>,
+    merged_rules: Arc<ArcSwap<[AccountFilterRule]>>,
+}
+
+impl Default for AccountFilterGate {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(AccountFilterGateInner::default())),
+            merged_rules: Arc::new(ArcSwap::from(Arc::<[AccountFilterRule]>::from(Vec::new()))),
+        }
+    }
+}
+
+impl AccountFilterGate {
+    pub fn update_client_rules(&self, client_id: usize, rules: Vec<AccountFilterRule>) {
+        let merged = {
+            let mut inner = match self.inner.write() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if rules.is_empty() {
+                inner.client_rules.remove(&client_id);
+            } else {
+                inner.client_rules.insert(client_id, rules.into());
+            }
+            inner.build_merged()
+        };
+        self.merged_rules.store(merged);
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let merged = {
+            let mut inner = match self.inner.write() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if inner.client_rules.remove(&client_id).is_some() {
+                inner.build_merged()
+            } else {
+                return;
+            }
+        };
+        self.merged_rules.store(merged);
+    }
+
+    pub fn allows(&self, account: &ReplicaAccountInfoV3<'_>) -> bool {
+        let Ok(pubkey) = Pubkey::try_from(account.pubkey) else {
+            return false;
+        };
+        let Ok(owner) = Pubkey::try_from(account.owner) else {
+            return false;
+        };
+        self.allows_prepared(account.txn.is_some(), &pubkey, &owner)
+    }
+
+    pub fn allows_prepared(
+        &self,
+        has_txn_signature: bool,
+        pubkey: &Pubkey,
+        owner: &Pubkey,
+    ) -> bool {
+        let rules = self.merged_rules.load_full();
+
+        if rules.is_empty() {
+            return false;
+        }
+
+        rules
+            .iter()
+            .any(|rule| rule.matches_prepared(has_txn_signature, pubkey, owner))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct TransactionFilterRule {
     pub vote: Option<bool>,
     pub failed: Option<bool>,
@@ -119,22 +256,170 @@ pub struct TransactionFilterRule {
     pub account_include: Vec<Pubkey>,
     pub account_exclude: Vec<Pubkey>,
     pub account_required: Vec<Pubkey>,
+    account_include_set: HashSet<Pubkey>,
+    account_exclude_set: HashSet<Pubkey>,
+    account_required_set: HashSet<Pubkey>,
 }
 
 impl TransactionFilterRule {
     fn from_inner(inner: &FilterTransactionsInner) -> Self {
+        let account_include_set = inner.account_include.clone();
+        let account_exclude_set = inner.account_exclude.clone();
+        let account_required_set = inner.account_required.clone();
         Self {
             vote: inner.vote,
             failed: inner.failed,
             signature: inner.signature.clone(),
-            account_include: inner.account_include.iter().copied().collect(),
-            account_exclude: inner.account_exclude.iter().copied().collect(),
-            account_required: inner.account_required.iter().copied().collect(),
+            account_include: account_include_set.iter().copied().collect(),
+            account_exclude: account_exclude_set.iter().copied().collect(),
+            account_required: account_required_set.iter().copied().collect(),
+            account_include_set,
+            account_exclude_set,
+            account_required_set,
         }
     }
 
-    fn contains_account(tx_info: &ReplicaTransactionInfoV3<'_>, pubkey: &Pubkey) -> bool {
-        tx_info
+    fn matches_prepared(
+        &self,
+        tx_is_vote: bool,
+        tx_is_failed: bool,
+        signature: &Signature,
+        account_keys: &HashSet<Pubkey>,
+    ) -> bool {
+        if let Some(expected_vote) = self.vote {
+            if expected_vote != tx_is_vote {
+                return false;
+            }
+        }
+
+        if let Some(expected_failed) = self.failed {
+            if expected_failed != tx_is_failed {
+                return false;
+            }
+        }
+
+        if let Some(expected_signature) = &self.signature {
+            if expected_signature != signature {
+                return false;
+            }
+        }
+
+        if !self.account_include_set.is_empty()
+            && self.account_include_set.is_disjoint(account_keys)
+        {
+            return false;
+        }
+
+        if !self.account_exclude_set.is_empty()
+            && !self.account_exclude_set.is_disjoint(account_keys)
+        {
+            return false;
+        }
+
+        if !self.account_required_set.is_empty()
+            && !self.account_required_set.is_subset(account_keys)
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug)]
+struct TransactionFilterGateInner {
+    client_rules: HashMap<usize, Arc<[TransactionFilterRule]>>,
+}
+
+impl Default for TransactionFilterGateInner {
+    fn default() -> Self {
+        Self {
+            client_rules: HashMap::new(),
+        }
+    }
+}
+
+impl TransactionFilterGateInner {
+    fn build_merged(&self) -> Arc<[TransactionFilterRule]> {
+        let total_rules = self
+            .client_rules
+            .values()
+            .map(|rules| rules.len())
+            .sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in self.client_rules.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        merged.into()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionFilterGate {
+    inner: Arc<RwLock<TransactionFilterGateInner>>,
+    merged_rules: Arc<ArcSwap<[TransactionFilterRule]>>,
+}
+
+impl Default for TransactionFilterGate {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(TransactionFilterGateInner::default())),
+            merged_rules: Arc::new(ArcSwap::from(Arc::<[TransactionFilterRule]>::from(
+                Vec::new(),
+            ))),
+        }
+    }
+}
+
+impl TransactionFilterGate {
+    pub fn update_client_rules(&self, client_id: usize, rules: Vec<TransactionFilterRule>) {
+        let merged = {
+            let mut inner = match self.inner.write() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if rules.is_empty() {
+                inner.client_rules.remove(&client_id);
+            } else {
+                inner.client_rules.insert(client_id, rules.into());
+            }
+            inner.build_merged()
+        };
+        self.merged_rules.store(merged);
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let merged = {
+            let mut inner = match self.inner.write() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if inner.client_rules.remove(&client_id).is_some() {
+                inner.build_merged()
+            } else {
+                return;
+            }
+        };
+        self.merged_rules.store(merged);
+    }
+
+    pub fn allows(&self, tx_info: &ReplicaTransactionInfoV3<'_>) -> bool {
+        self.allows_and_account_keys(tx_info).is_some()
+    }
+
+    pub fn allows_and_account_keys(
+        &self,
+        tx_info: &ReplicaTransactionInfoV3<'_>,
+    ) -> Option<HashSet<Pubkey>> {
+        let rules = self.merged_rules.load_full();
+
+        if rules.is_empty() {
+            return None;
+        }
+
+        let account_keys: HashSet<Pubkey> = tx_info
             .transaction
             .message
             .static_account_keys()
@@ -153,132 +438,21 @@ impl TransactionFilterRule {
                     .readonly
                     .iter(),
             )
-            .any(|key| key == pubkey)
-    }
+            .copied()
+            .collect();
 
-    pub fn matches_geyser(&self, tx_info: &ReplicaTransactionInfoV3<'_>) -> bool {
-        if let Some(is_vote) = self.vote {
-            if is_vote != tx_info.is_vote {
-                return false;
-            }
-        }
+        let is_vote = tx_info.is_vote;
+        let is_failed = tx_info.transaction_status_meta.status.is_err();
+        let signature = tx_info.signature;
 
-        if let Some(is_failed) = self.failed {
-            if is_failed != tx_info.transaction_status_meta.status.is_err() {
-                return false;
-            }
-        }
-
-        if let Some(signature) = &self.signature {
-            if signature != tx_info.signature {
-                return false;
-            }
-        }
-
-        if !self.account_include.is_empty()
-            && !self
-                .account_include
-                .iter()
-                .any(|pubkey| Self::contains_account(tx_info, pubkey))
+        if rules
+            .iter()
+            .any(|rule| rule.matches_prepared(is_vote, is_failed, signature, &account_keys))
         {
-            return false;
-        }
-
-        if !self.account_exclude.is_empty()
-            && self
-                .account_exclude
-                .iter()
-                .any(|pubkey| Self::contains_account(tx_info, pubkey))
-        {
-            return false;
-        }
-
-        if !self.account_required.is_empty()
-            && self
-                .account_required
-                .iter()
-                .any(|pubkey| !Self::contains_account(tx_info, pubkey))
-        {
-            return false;
-        }
-
-        true
-    }
-}
-
-#[derive(Debug)]
-struct TransactionFilterGateInner {
-    client_rules: HashMap<usize, Arc<[TransactionFilterRule]>>,
-    merged_rules: Arc<[TransactionFilterRule]>,
-}
-
-impl Default for TransactionFilterGateInner {
-    fn default() -> Self {
-        Self {
-            client_rules: HashMap::new(),
-            merged_rules: Vec::new().into(),
-        }
-    }
-}
-
-impl TransactionFilterGateInner {
-    fn rebuild_merged(&mut self) {
-        let total_rules = self
-            .client_rules
-            .values()
-            .map(|rules| rules.len())
-            .sum::<usize>();
-        let mut merged = Vec::with_capacity(total_rules);
-        for rules in self.client_rules.values() {
-            merged.extend(rules.iter().cloned());
-        }
-        self.merged_rules = merged.into();
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TransactionFilterGate {
-    inner: Arc<RwLock<TransactionFilterGateInner>>,
-}
-
-impl TransactionFilterGate {
-    pub fn update_client_rules(&self, client_id: usize, rules: Vec<TransactionFilterRule>) {
-        let mut inner = match self.inner.write() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        if rules.is_empty() {
-            inner.client_rules.remove(&client_id);
+            Some(account_keys)
         } else {
-            inner.client_rules.insert(client_id, rules.into());
+            None
         }
-        inner.rebuild_merged();
-    }
-
-    pub fn remove_client(&self, client_id: usize) {
-        let mut inner = match self.inner.write() {
-            Ok(inner) => inner,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        if inner.client_rules.remove(&client_id).is_some() {
-            inner.rebuild_merged();
-        }
-    }
-
-    pub fn allows(&self, tx_info: &ReplicaTransactionInfoV3<'_>) -> bool {
-        let rules = match self.inner.read() {
-            Ok(inner) => Arc::clone(&inner.merged_rules),
-            // Fail-open on poisoned lock to avoid dropping valid updates.
-            Err(_poisoned) => return true,
-        };
-
-        if rules.is_empty() {
-            return false;
-        }
-
-        rules.iter().any(|rule| rule.matches_geyser(tx_info))
     }
 }
 
@@ -402,6 +576,12 @@ impl Filter {
         !self.blocks.filters.is_empty()
     }
 
+    pub fn get_account_filter_rules(&self) -> Vec<AccountFilterRule> {
+        let mut rules = Vec::with_capacity(self.accounts.filters.len());
+        self.accounts.collect_rules(&mut rules);
+        rules
+    }
+
     pub fn get_transaction_filter_rules(&self) -> Vec<TransactionFilterRule> {
         let mut rules = Vec::with_capacity(
             self.transactions.filters.len() + self.transactions_status.filters.len(),
@@ -517,6 +697,51 @@ impl FilterAccounts {
             map_required.insert(names.get(name)?);
         }
         Ok(required)
+    }
+
+    fn collect_rules(&self, rules: &mut Vec<AccountFilterRule>) {
+        let mut rules_by_name =
+            HashMap::<FilterName, AccountFilterRule>::with_capacity(self.filters.len());
+        for (name, _state) in self.filters.iter() {
+            rules_by_name.insert(
+                name.clone(),
+                AccountFilterRule {
+                    nonempty_txn_signature: None,
+                    account: HashSet::new(),
+                    account_required: self.account_required.contains(name),
+                    owner: HashSet::new(),
+                    owner_required: self.owner_required.contains(name),
+                },
+            );
+        }
+
+        for (name, nonempty_txn_signature) in self.nonempty_txn_signature.iter() {
+            if let Some(rule) = rules_by_name.get_mut(name) {
+                rule.nonempty_txn_signature = *nonempty_txn_signature;
+            }
+        }
+
+        for (pubkey, names) in self.account.iter() {
+            for name in names.iter() {
+                if let Some(rule) = rules_by_name.get_mut(name) {
+                    rule.account.insert(*pubkey);
+                }
+            }
+        }
+
+        for (pubkey, names) in self.owner.iter() {
+            for name in names.iter() {
+                if let Some(rule) = rules_by_name.get_mut(name) {
+                    rule.owner.insert(*pubkey);
+                }
+            }
+        }
+
+        for (name, _state) in self.filters.iter() {
+            if let Some(rule) = rules_by_name.remove(name) {
+                rules.push(rule);
+            }
+        }
     }
 
     fn get_updates(
