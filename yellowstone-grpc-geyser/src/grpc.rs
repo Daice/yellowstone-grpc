@@ -32,7 +32,7 @@ use {
         collections::{BTreeMap, HashMap},
         net::SocketAddr,
         sync::{
-            atomic::{AtomicU64, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, LazyLock, Mutex as StdMutex,
         },
         time::SystemTime,
@@ -498,6 +498,8 @@ impl GrpcService {
         is_reload: bool,
         service_cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
+        account_filter_gate: AccountFilterGate,
+        tx_filter_gate: TransactionFilterGate,
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
@@ -621,6 +623,8 @@ impl GrpcService {
                 replay_stored_slots_rx,
                 replay_first_available_slot,
                 config.replay_stored_slots,
+                config.processed_messages_max,
+                config.processed_messages_flush_interval,
             )
             .await;
         });
@@ -664,6 +668,8 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        processed_messages_max: usize,
+        processed_messages_flush_interval: Duration,
     ) {
         let processed_messages_max = processed_messages_max.max(1);
         let processed_messages_flush_interval = if processed_messages_flush_interval.is_zero() {
@@ -930,10 +936,7 @@ impl GrpcService {
                                 .reset(Instant::now() + processed_messages_flush_interval);
                         } else {
                             processed_messages.push(message);
-                            if processed_messages.len() >= processed_messages_max
-                                || !confirmed_messages.is_empty()
-                                || !finalized_messages.is_empty()
-                            {
+                            if processed_messages.len() >= processed_messages_max {
                                 let _ = broadcast_tx
                                     .send((CommitmentLevel::Processed, processed_messages.into()));
                                 processed_messages = Vec::with_capacity(processed_messages_max);
@@ -947,7 +950,7 @@ impl GrpcService {
                 () = &mut processed_sleep => {
                     if !processed_messages.is_empty() {
                         let _ = broadcast_tx.send((CommitmentLevel::Processed, processed_messages.into()));
-                        processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
+                        processed_messages = Vec::with_capacity(processed_messages_max);
                     }
                     processed_sleep
                         .as_mut()
@@ -1008,6 +1011,9 @@ impl GrpcService {
         mut messages_rx: broadcast::Receiver<BroadcastedMessage>,
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
+        active_blocks_subscriptions: Arc<AtomicUsize>,
+        account_filter_gate: AccountFilterGate,
+        tx_filter_gate: TransactionFilterGate,
         maybe_remote_peer_sk_addr: Option<SocketAddr>,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
@@ -1021,6 +1027,7 @@ impl GrpcService {
             cancellation_token,
         );
         let cancellation_token = session.cancellation_token.clone();
+        let has_blocks_subscription = Arc::new(AtomicBool::new(false));
 
         if let Some(snapshot_rx) = snapshot_rx.take() {
             info!("client #{id}: snapshot requested");
@@ -1031,6 +1038,10 @@ impl GrpcService {
                 &mut client_rx,
                 snapshot_rx,
                 &mut session.filter,
+                &active_blocks_subscriptions,
+                &has_blocks_subscription,
+                &account_filter_gate,
+                &tx_filter_gate,
                 cancellation_token.clone(),
             )
             .await;
@@ -1043,11 +1054,21 @@ impl GrpcService {
                         "server is shutting down try again later",
                     )));
                     session.disconnect_reason = "server_shutdown";
+                    if has_blocks_subscription.swap(false, Ordering::Relaxed) {
+                        active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    account_filter_gate.remove_client(id);
+                    tx_filter_gate.remove_client(id);
                     return;
                 }
                 Err(ClientSnapshotReplayError::ClientGrpcConnectionClosed) => {
                     info!("client #{id}: grpc connection closed");
                     session.disconnect_reason = "client_closed";
+                    if has_blocks_subscription.swap(false, Ordering::Relaxed) {
+                        active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    account_filter_gate.remove_client(id);
+                    tx_filter_gate.remove_client(id);
                     return;
                 }
             }
@@ -1082,6 +1103,15 @@ impl GrpcService {
 
                     match message {
                         Some(Some((from_slot, filter_new))) => {
+                            Self::sync_blocks_subscriptions(
+                                &active_blocks_subscriptions,
+                                &has_blocks_subscription,
+                                &filter_new,
+                            );
+                            account_filter_gate
+                                .update_client_rules(id, filter_new.get_account_filter_rules());
+                            tx_filter_gate
+                                .update_client_rules(id, filter_new.get_transaction_filter_rules());
                             session.set_filter(filter_new);
                             info!("client #{id}: filter updated");
 
@@ -1212,6 +1242,12 @@ impl GrpcService {
                 }
             }
         }
+
+        if has_blocks_subscription.swap(false, Ordering::Relaxed) {
+            active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
+        }
+        account_filter_gate.remove_client(id);
+        tx_filter_gate.remove_client(id);
     }
 
     async fn client_loop_snapshot(
@@ -1461,6 +1497,9 @@ impl Geyser for GrpcService {
             self.broadcast_tx.subscribe(),
             self.replay_stored_slots_tx.clone(),
             self.debug_clients_tx.clone(),
+            Arc::clone(&self.active_blocks_subscriptions),
+            self.account_filter_gate.clone(),
+            self.tx_filter_gate.clone(),
             maybe_remote_peer_sk_addr,
             client_cancellation_token,
             self.task_tracker.clone(),

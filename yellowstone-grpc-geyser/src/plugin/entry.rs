@@ -3,9 +3,12 @@ use {
         config::Config,
         grpc::GrpcService,
         metrics::{self, PrometheusService},
-        plugin::message::{
-            Message, MessageAccount, MessageBlockMeta, MessageEntry, MessageSlot,
-            MessageTransaction,
+        plugin::{
+            filter::{AccountFilterGate, TransactionFilterGate},
+            message::{
+                Message, MessageAccount, MessageBlockMeta, MessageEntry, MessageSlot,
+                MessageTransaction,
+            },
         },
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -108,6 +111,10 @@ impl GeyserPlugin for Plugin {
             .enable_all()
             .build()
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
+        let account_filter_gate = AccountFilterGate::default();
+        let account_filter_gate_for_grpc = account_filter_gate.clone();
+        let tx_filter_gate = TransactionFilterGate::default();
+        let tx_filter_gate_for_grpc = tx_filter_gate.clone();
 
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
@@ -127,6 +134,8 @@ impl GeyserPlugin for Plugin {
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
+                account_filter_gate_for_grpc,
+                tx_filter_gate_for_grpc,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
