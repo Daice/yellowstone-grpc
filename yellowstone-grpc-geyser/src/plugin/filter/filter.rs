@@ -284,7 +284,7 @@ impl TransactionFilterRule {
         tx_is_vote: bool,
         tx_is_failed: bool,
         signature: &Signature,
-        account_keys: &HashSet<Pubkey>,
+        account_keys: &TxAccountKeysView<'_>,
     ) -> bool {
         if let Some(expected_vote) = self.vote {
             if expected_vote != tx_is_vote {
@@ -305,24 +305,68 @@ impl TransactionFilterRule {
         }
 
         if !self.account_include_set.is_empty()
-            && self.account_include_set.is_disjoint(account_keys)
+            && !account_keys.any_in_set(&self.account_include_set)
         {
             return false;
         }
 
         if !self.account_exclude_set.is_empty()
-            && !self.account_exclude_set.is_disjoint(account_keys)
+            && account_keys.any_in_set(&self.account_exclude_set)
         {
             return false;
         }
 
         if !self.account_required_set.is_empty()
-            && !self.account_required_set.is_subset(account_keys)
+            && !self
+                .account_required_set
+                .iter()
+                .all(|required| account_keys.contains(required))
         {
             return false;
         }
 
         true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TxAccountKeysView<'a> {
+    static_keys: &'a [Pubkey],
+    loaded_writable: &'a [Pubkey],
+    loaded_readonly: &'a [Pubkey],
+}
+
+impl<'a> TxAccountKeysView<'a> {
+    fn new(tx_info: &'a ReplicaTransactionInfoV3<'_>) -> Self {
+        Self {
+            static_keys: tx_info.transaction.message.static_account_keys(),
+            loaded_writable: &tx_info.transaction_status_meta.loaded_addresses.writable,
+            loaded_readonly: &tx_info.transaction_status_meta.loaded_addresses.readonly,
+        }
+    }
+
+    #[inline]
+    fn any_in_set(&self, set: &HashSet<Pubkey>) -> bool {
+        self.static_keys.iter().any(|key| set.contains(key))
+            || self.loaded_writable.iter().any(|key| set.contains(key))
+            || self.loaded_readonly.iter().any(|key| set.contains(key))
+    }
+
+    #[inline]
+    fn contains(&self, key: &Pubkey) -> bool {
+        self.static_keys.contains(key)
+            || self.loaded_writable.contains(key)
+            || self.loaded_readonly.contains(key)
+    }
+
+    fn to_hash_set(&self) -> HashSet<Pubkey> {
+        let mut account_keys = HashSet::with_capacity(
+            self.static_keys.len() + self.loaded_writable.len() + self.loaded_readonly.len(),
+        );
+        account_keys.extend(self.static_keys.iter().copied());
+        account_keys.extend(self.loaded_writable.iter().copied());
+        account_keys.extend(self.loaded_readonly.iter().copied());
+        account_keys
     }
 }
 
@@ -417,27 +461,7 @@ impl TransactionFilterGate {
             return None;
         }
 
-        let account_keys: HashSet<Pubkey> = tx_info
-            .transaction
-            .message
-            .static_account_keys()
-            .iter()
-            .chain(
-                tx_info
-                    .transaction_status_meta
-                    .loaded_addresses
-                    .writable
-                    .iter(),
-            )
-            .chain(
-                tx_info
-                    .transaction_status_meta
-                    .loaded_addresses
-                    .readonly
-                    .iter(),
-            )
-            .copied()
-            .collect();
+        let account_keys = TxAccountKeysView::new(tx_info);
 
         let is_vote = tx_info.is_vote;
         let is_failed = tx_info.transaction_status_meta.status.is_err();
@@ -447,7 +471,7 @@ impl TransactionFilterGate {
             .iter()
             .any(|rule| rule.matches_prepared(is_vote, is_failed, signature, &account_keys))
         {
-            Some(account_keys)
+            Some(account_keys.to_hash_set())
         } else {
             None
         }
