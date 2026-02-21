@@ -482,6 +482,7 @@ pub struct GrpcService {
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     active_blocks_subscriptions: Arc<AtomicUsize>,
+    active_slots_subscriptions: Arc<AtomicUsize>,
     account_filter_gate: AccountFilterGate,
     tx_filter_gate: TransactionFilterGate,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
@@ -540,6 +541,7 @@ impl GrpcService {
         // Messages to clients combined by commitment
         let (broadcast_tx, _) = broadcast::channel(config.channel_capacity);
         let active_blocks_subscriptions = Arc::new(AtomicUsize::new(0));
+        let active_slots_subscriptions = Arc::new(AtomicUsize::new(0));
         // attempt to prevent spam of geyser loop with capacity eq 1
         let (replay_first_available_slot, replay_stored_slots_tx, replay_stored_slots_rx) =
             if config.replay_stored_slots == 0 {
@@ -597,6 +599,7 @@ impl GrpcService {
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
             active_blocks_subscriptions: Arc::clone(&active_blocks_subscriptions),
+            active_slots_subscriptions: Arc::clone(&active_slots_subscriptions),
             account_filter_gate,
             tx_filter_gate,
             debug_clients_tx,
@@ -620,6 +623,7 @@ impl GrpcService {
                 blocks_meta_tx,
                 broadcast_tx,
                 active_blocks_subscriptions,
+                active_slots_subscriptions,
                 replay_stored_slots_rx,
                 replay_first_available_slot,
                 config.replay_stored_slots,
@@ -665,6 +669,7 @@ impl GrpcService {
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
         broadcast_tx: broadcast::Sender<BroadcastedMessage>,
         active_blocks_subscriptions: Arc<AtomicUsize>,
+        active_slots_subscriptions: Arc<AtomicUsize>,
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
@@ -695,8 +700,6 @@ impl GrpcService {
                     };
                     metrics::message_queue_size_dec();
                     let msgid = msgid_gen.next();
-                    let reconstruct_blocks =
-                        active_blocks_subscriptions.load(Ordering::Relaxed) > 0;
 
                     // Update metrics
                     if let Message::Slot(slot_message) = &message {
@@ -709,6 +712,34 @@ impl GrpcService {
                             let _ = blocks_meta_tx.send(message.clone());
                         }
                     }
+
+                    let no_blocks_subscriptions =
+                        active_blocks_subscriptions.load(Ordering::Relaxed) == 0;
+                    let no_slots_subscriptions =
+                        active_slots_subscriptions.load(Ordering::Relaxed) == 0;
+                    let fast_path_enabled =
+                        replay_stored_slots == 0 && no_blocks_subscriptions && no_slots_subscriptions;
+                    if fast_path_enabled {
+                        if let Message::Account(msg) = &message {
+                            metrics::observe_geyser_account_update_received(msg.account.data.len());
+                        }
+
+                        let is_slot_message = matches!(&message, Message::Slot(_));
+                        processed_messages.push((msgid, message));
+                        if is_slot_message || processed_messages.len() >= processed_messages_max {
+                            let batch = std::mem::replace(
+                                &mut processed_messages,
+                                Vec::with_capacity(processed_messages_max),
+                            );
+                            let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::new(batch)));
+                            processed_sleep
+                                .as_mut()
+                                .reset(Instant::now() + processed_messages_flush_interval);
+                        }
+                        continue;
+                    }
+
+                    let reconstruct_blocks = !no_blocks_subscriptions;
 
                     // Remove outdated block reconstruction info
                     match &message {
@@ -1000,6 +1031,21 @@ impl GrpcService {
         }
     }
 
+    fn sync_slots_subscriptions(
+        active_slots_subscriptions: &Arc<AtomicUsize>,
+        has_slots_subscription: &Arc<AtomicBool>,
+        filter: &Filter,
+    ) {
+        let has_slots_subscription_new = filter.has_slots_subscriptions();
+        let has_slots_subscription_old =
+            has_slots_subscription.swap(has_slots_subscription_new, Ordering::Relaxed);
+        if !has_slots_subscription_old && has_slots_subscription_new {
+            active_slots_subscriptions.fetch_add(1, Ordering::Relaxed);
+        } else if has_slots_subscription_old && !has_slots_subscription_new {
+            active_slots_subscriptions.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn client_loop(
         id: usize,
@@ -1012,6 +1058,7 @@ impl GrpcService {
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         active_blocks_subscriptions: Arc<AtomicUsize>,
+        active_slots_subscriptions: Arc<AtomicUsize>,
         account_filter_gate: AccountFilterGate,
         tx_filter_gate: TransactionFilterGate,
         maybe_remote_peer_sk_addr: Option<SocketAddr>,
@@ -1028,6 +1075,7 @@ impl GrpcService {
         );
         let cancellation_token = session.cancellation_token.clone();
         let has_blocks_subscription = Arc::new(AtomicBool::new(false));
+        let has_slots_subscription = Arc::new(AtomicBool::new(false));
 
         if let Some(snapshot_rx) = snapshot_rx.take() {
             info!("client #{id}: snapshot requested");
@@ -1040,6 +1088,8 @@ impl GrpcService {
                 &mut session.filter,
                 &active_blocks_subscriptions,
                 &has_blocks_subscription,
+                &active_slots_subscriptions,
+                &has_slots_subscription,
                 &account_filter_gate,
                 &tx_filter_gate,
                 cancellation_token.clone(),
@@ -1057,6 +1107,9 @@ impl GrpcService {
                     if has_blocks_subscription.swap(false, Ordering::Relaxed) {
                         active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
                     }
+                    if has_slots_subscription.swap(false, Ordering::Relaxed) {
+                        active_slots_subscriptions.fetch_sub(1, Ordering::Relaxed);
+                    }
                     account_filter_gate.remove_client(id);
                     tx_filter_gate.remove_client(id);
                     return;
@@ -1066,6 +1119,9 @@ impl GrpcService {
                     session.disconnect_reason = "client_closed";
                     if has_blocks_subscription.swap(false, Ordering::Relaxed) {
                         active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    if has_slots_subscription.swap(false, Ordering::Relaxed) {
+                        active_slots_subscriptions.fetch_sub(1, Ordering::Relaxed);
                     }
                     account_filter_gate.remove_client(id);
                     tx_filter_gate.remove_client(id);
@@ -1106,6 +1162,11 @@ impl GrpcService {
                             Self::sync_blocks_subscriptions(
                                 &active_blocks_subscriptions,
                                 &has_blocks_subscription,
+                                &filter_new,
+                            );
+                            Self::sync_slots_subscriptions(
+                                &active_slots_subscriptions,
+                                &has_slots_subscription,
                                 &filter_new,
                             );
                             account_filter_gate
@@ -1246,6 +1307,9 @@ impl GrpcService {
         if has_blocks_subscription.swap(false, Ordering::Relaxed) {
             active_blocks_subscriptions.fetch_sub(1, Ordering::Relaxed);
         }
+        if has_slots_subscription.swap(false, Ordering::Relaxed) {
+            active_slots_subscriptions.fetch_sub(1, Ordering::Relaxed);
+        }
         account_filter_gate.remove_client(id);
         tx_filter_gate.remove_client(id);
     }
@@ -1259,6 +1323,8 @@ impl GrpcService {
         filter: &mut Filter,
         active_blocks_subscriptions: &Arc<AtomicUsize>,
         has_blocks_subscription: &Arc<AtomicBool>,
+        active_slots_subscriptions: &Arc<AtomicUsize>,
+        has_slots_subscription: &Arc<AtomicBool>,
         account_filter_gate: &AccountFilterGate,
         tx_filter_gate: &TransactionFilterGate,
         cancellation_token: CancellationToken,
@@ -1286,6 +1352,11 @@ impl GrpcService {
                             Self::sync_blocks_subscriptions(
                                 active_blocks_subscriptions,
                                 has_blocks_subscription,
+                                &filter_new,
+                            );
+                            Self::sync_slots_subscriptions(
+                                active_slots_subscriptions,
+                                has_slots_subscription,
                                 &filter_new,
                             );
                             account_filter_gate
@@ -1498,6 +1569,7 @@ impl Geyser for GrpcService {
             self.replay_stored_slots_tx.clone(),
             self.debug_clients_tx.clone(),
             Arc::clone(&self.active_blocks_subscriptions),
+            Arc::clone(&self.active_slots_subscriptions),
             self.account_filter_gate.clone(),
             self.tx_filter_gate.clone(),
             maybe_remote_peer_sk_addr,
@@ -1632,7 +1704,10 @@ mod tests {
     use {
         super::*,
         crate::{
-            plugin::filter::{limits::FilterLimits, name::FilterNames, Filter},
+            plugin::filter::{
+                limits::FilterLimits, name::FilterNames, AccountFilterGate, Filter,
+                TransactionFilterGate,
+            },
             util::stream::load_aware_channel,
         },
         yellowstone_grpc_proto::prelude::{SubscribeRequest, SubscribeRequestFilterSlots},
@@ -1706,6 +1781,10 @@ mod tests {
             broadcast_tx.subscribe(),
             None,
             None,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            AccountFilterGate::default(),
+            TransactionFilterGate::default(),
             None,
             ct.clone(),
             tt.clone(),

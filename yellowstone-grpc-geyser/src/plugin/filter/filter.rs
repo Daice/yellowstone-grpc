@@ -574,6 +574,10 @@ impl Filter {
         !self.blocks.filters.is_empty()
     }
 
+    pub fn has_slots_subscriptions(&self) -> bool {
+        !self.slots.filters.is_empty()
+    }
+
     pub fn get_account_filter_rules(&self) -> Vec<AccountFilterRule> {
         let mut rules = Vec::with_capacity(self.accounts.filters.len());
         self.accounts.collect_rules(&mut rules);
