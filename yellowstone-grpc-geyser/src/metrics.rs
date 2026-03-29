@@ -151,6 +151,26 @@ lazy_static::lazy_static! {
         &["subscriber_id"]
     ).unwrap();
 
+    static ref TX_EARLY_FILTER_PASS_TOTAL: IntCounter = IntCounter::new(
+        "tx_early_filter_pass_total",
+        "Number of transactions passed by early transaction filter"
+    ).unwrap();
+
+    static ref TX_EARLY_FILTER_DROP_TOTAL: IntCounter = IntCounter::new(
+        "tx_early_filter_drop_total",
+        "Number of transactions dropped by early transaction filter"
+    ).unwrap();
+
+    static ref ACCOUNT_EARLY_FILTER_PASS_TOTAL: IntCounter = IntCounter::new(
+        "account_early_filter_pass_total",
+        "Number of accounts passed by early account filter"
+    ).unwrap();
+
+    static ref ACCOUNT_EARLY_FILTER_DROP_TOTAL: IntCounter = IntCounter::new(
+        "account_early_filter_drop_total",
+        "Number of accounts dropped by early account filter"
+    ).unwrap();
+
 }
 
 pub fn incr_grpc_method_call_count<S: AsRef<str>>(method: S) {
@@ -343,6 +363,10 @@ impl PrometheusService {
             register!(TRAFFIC_SENT_PER_REMOTE_IP);
             register!(GRPC_METHOD_CALL_COUNT);
             register!(GRPC_SERVICE_OUTBOUND_BYTES);
+            register!(TX_EARLY_FILTER_PASS_TOTAL);
+            register!(TX_EARLY_FILTER_DROP_TOTAL);
+            register!(ACCOUNT_EARLY_FILTER_PASS_TOTAL);
+            register!(ACCOUNT_EARLY_FILTER_DROP_TOTAL);
 
             VERSION
                 .with_label_values(&[
@@ -564,6 +588,22 @@ pub fn remove_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(remote
         .expect("remove_label_values");
 }
 
+pub fn tx_early_filter_pass_inc() {
+    TX_EARLY_FILTER_PASS_TOTAL.inc();
+}
+
+pub fn tx_early_filter_drop_inc() {
+    TX_EARLY_FILTER_DROP_TOTAL.inc();
+}
+
+pub fn account_early_filter_pass_inc() {
+    ACCOUNT_EARLY_FILTER_PASS_TOTAL.inc();
+}
+
+pub fn account_early_filter_drop_inc() {
+    ACCOUNT_EARLY_FILTER_DROP_TOTAL.inc();
+}
+
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
 pub fn reset_metrics() {
     // Reset gauge metrics to 0
@@ -587,6 +627,10 @@ pub fn reset_metrics() {
     TRAFFIC_SENT_PER_REMOTE_IP.reset();
     GRPC_SERVICE_OUTBOUND_BYTES.reset();
     GRPC_METHOD_CALL_COUNT.reset();
+    TX_EARLY_FILTER_PASS_TOTAL.reset();
+    TX_EARLY_FILTER_DROP_TOTAL.reset();
+    ACCOUNT_EARLY_FILTER_PASS_TOTAL.reset();
+    ACCOUNT_EARLY_FILTER_DROP_TOTAL.reset();
 
     // Note: VERSION and GEYSER_ACCOUNT_UPDATE_RECEIVED are intentionally not reset
     // - VERSION contains build info set once on startup
