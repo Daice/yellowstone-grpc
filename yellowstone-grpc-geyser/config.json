@@ -14,8 +14,14 @@
       "key_path": ""
     },
     "compression": {
-      "accept": ["gzip", "zstd"],
-      "send": ["gzip", "zstd"]
+      "accept": [
+        "gzip",
+        "zstd"
+      ],
+      "send": [
+        "gzip",
+        "zstd"
+      ]
     },
     "server_http2_adaptive_window": null,
     "server_http2_keepalive_interval": null,
@@ -29,6 +35,8 @@
     "unary_concurrency_limit": 100,
     "unary_disabled": false,
     "x_token": null,
+    "processed_messages_max": 8,
+    "processed_messages_flush_interval": "2ms",
     "replay_stored_slots": 0,
     "filter_name_size_limit": 128,
     "filter_names_size_limit": 4096,
@@ -38,9 +46,13 @@
         "max": 1,
         "any": false,
         "account_max": 10,
-        "account_reject": ["TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"],
+        "account_reject": [
+          "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        ],
         "owner_max": 10,
-        "owner_reject": ["11111111111111111111111111111111"],
+        "owner_reject": [
+          "11111111111111111111111111111111"
+        ],
         "data_slice_max": 2
       },
       "slots": {

@@ -111,8 +111,8 @@ pub fn create_transaction_meta(meta: &TransactionStatusMeta) -> proto::Transacti
         .as_deref()
         .map(create_inner_instructions_vec)
         .unwrap_or_default();
-    let log_messages_none = log_messages.is_none();
-    let log_messages = log_messages.clone().unwrap_or_default();
+    let log_messages_none = true;
+    let log_messages = Vec::new();
     let pre_token_balances = pre_token_balances
         .as_deref()
         .map(create_token_balances)

@@ -21,6 +21,7 @@ publish = false
 
 [workspace.dependencies]
 affinity = "0.1.2"
+arc-swap = "1.7.1"
 anyhow = "1.0.98"
 backoff = "0.4.0"
 base64 = "0.22.1"
