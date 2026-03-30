@@ -6,6 +6,7 @@ pub mod message;
 pub mod name;
 
 pub use filter::{
-    AccountFilterGate, AccountFilterRule, DeshredFilter, Filter, FilterAccountsDataSlice,
-    FilterError, FilterResult, TransactionFilterGate, TransactionFilterRule,
+    AccountFilterGate, AccountFilterRule, DeshredFilter, DeshredTransactionFilterGate,
+    DeshredTransactionFilterRule, Filter, FilterAccountsDataSlice, FilterError, FilterResult,
+    TransactionFilterGate, TransactionFilterRule,
 };

@@ -5,10 +5,10 @@ use {
         metrics::{self, PrometheusService},
         parallel::ParallelEncoder,
         plugin::{
-            filter::{AccountFilterGate, TransactionFilterGate},
+            filter::{AccountFilterGate, DeshredTransactionFilterGate, TransactionFilterGate},
             message::{
-                Message, MessageAccount, MessageBlockMeta, MessageDeshredTransaction,
-                MessageEntry, MessageSlot, MessageTransaction,
+                Message, MessageAccount, MessageBlockMeta, MessageDeshredTransaction, MessageEntry,
+                MessageSlot, MessageTransaction,
             },
         },
     },
@@ -41,6 +41,7 @@ pub struct PluginInner {
     grpc_channel: mpsc::UnboundedSender<Message>,
     account_filter_gate: AccountFilterGate,
     tx_filter_gate: TransactionFilterGate,
+    deshred_tx_filter_gate: DeshredTransactionFilterGate,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     encoder_handle: std::thread::JoinHandle<()>,
@@ -117,6 +118,8 @@ impl GeyserPlugin for Plugin {
         let account_filter_gate_for_grpc = account_filter_gate.clone();
         let tx_filter_gate = TransactionFilterGate::default();
         let tx_filter_gate_for_grpc = tx_filter_gate.clone();
+        let deshred_tx_filter_gate = DeshredTransactionFilterGate::default();
+        let deshred_tx_filter_gate_for_grpc = deshred_tx_filter_gate.clone();
 
         let encoder_threads = config.grpc.encoder_threads;
         let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
@@ -142,6 +145,7 @@ impl GeyserPlugin for Plugin {
                 encoder,
                 account_filter_gate_for_grpc,
                 tx_filter_gate_for_grpc,
+                deshred_tx_filter_gate_for_grpc,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
@@ -166,6 +170,7 @@ impl GeyserPlugin for Plugin {
             grpc_channel,
             account_filter_gate,
             tx_filter_gate,
+            deshred_tx_filter_gate,
             plugin_cancellation_token,
             plugin_task_tracker,
             encoder_handle,
@@ -359,6 +364,12 @@ impl GeyserPlugin for Plugin {
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
             let ReplicaDeshredTransactionInfoVersions::V0_0_1(transaction) = transaction;
+
+            if !inner.deshred_tx_filter_gate.allows(transaction) {
+                metrics::deshred_tx_early_filter_drop_inc();
+                return Ok(());
+            }
+            metrics::deshred_tx_early_filter_pass_inc();
 
             let message = Message::DeshredTransaction(MessageDeshredTransaction::from_geyser(
                 transaction,

@@ -19,7 +19,7 @@ use {
         },
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaAccountInfoV3, ReplicaTransactionInfoV3,
+        ReplicaAccountInfoV3, ReplicaDeshredTransactionInfo, ReplicaTransactionInfoV3,
     },
     arc_swap::ArcSwap,
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
@@ -476,6 +476,248 @@ impl TransactionFilterGate {
         } else {
             None
         }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeshredTransactionFilterRule {
+    pub vote: Option<bool>,
+    pub account_include: Vec<Pubkey>,
+    pub account_exclude: Vec<Pubkey>,
+    pub account_required: Vec<Pubkey>,
+    account_include_set: HashSet<Pubkey>,
+    account_exclude_set: HashSet<Pubkey>,
+    account_required_set: HashSet<Pubkey>,
+}
+
+impl DeshredTransactionFilterRule {
+    fn from_inner(inner: &FilterDeshredTransactionsInner) -> Self {
+        let account_include_set = inner.account_include.clone();
+        let account_exclude_set = inner.account_exclude.clone();
+        let account_required_set = inner.account_required.clone();
+        Self {
+            vote: inner.vote,
+            account_include: account_include_set.iter().copied().collect(),
+            account_exclude: account_exclude_set.iter().copied().collect(),
+            account_required: account_required_set.iter().copied().collect(),
+            account_include_set,
+            account_exclude_set,
+            account_required_set,
+        }
+    }
+
+    fn matches_prepared(
+        &self,
+        tx_is_vote: bool,
+        account_keys: &DeshredTxAccountKeysView<'_>,
+    ) -> bool {
+        if let Some(expected_vote) = self.vote {
+            if expected_vote != tx_is_vote {
+                return false;
+            }
+        }
+
+        if !self.account_include_set.is_empty()
+            && !account_keys.any_in_set(&self.account_include_set)
+        {
+            return false;
+        }
+
+        if !self.account_exclude_set.is_empty()
+            && account_keys.any_in_set(&self.account_exclude_set)
+        {
+            return false;
+        }
+
+        if !self.account_required_set.is_empty()
+            && !self
+                .account_required_set
+                .iter()
+                .all(|required| account_keys.contains(required))
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeshredTxAccountKeysView<'a> {
+    static_keys: &'a [Pubkey],
+    loaded_writable: &'a [Pubkey],
+    loaded_readonly: &'a [Pubkey],
+}
+
+impl<'a> DeshredTxAccountKeysView<'a> {
+    fn new(tx_info: &'a ReplicaDeshredTransactionInfo<'_>) -> Self {
+        let (loaded_writable, loaded_readonly) = tx_info
+            .loaded_addresses
+            .map(|loaded_addresses| {
+                (
+                    loaded_addresses.writable.as_slice(),
+                    loaded_addresses.readonly.as_slice(),
+                )
+            })
+            .unwrap_or((&[][..], &[][..]));
+        Self {
+            static_keys: tx_info.transaction.message.static_account_keys(),
+            loaded_writable,
+            loaded_readonly,
+        }
+    }
+
+    #[inline]
+    fn any_in_set(&self, set: &HashSet<Pubkey>) -> bool {
+        self.static_keys.iter().any(|key| set.contains(key))
+            || self.loaded_writable.iter().any(|key| set.contains(key))
+            || self.loaded_readonly.iter().any(|key| set.contains(key))
+    }
+
+    #[inline]
+    fn contains(&self, key: &Pubkey) -> bool {
+        self.static_keys.contains(key)
+            || self.loaded_writable.contains(key)
+            || self.loaded_readonly.contains(key)
+    }
+}
+
+#[derive(Debug)]
+struct DeshredTransactionFilterGateInner {
+    client_rules: HashMap<usize, Arc<[DeshredTransactionFilterRule]>>,
+}
+
+impl Default for DeshredTransactionFilterGateInner {
+    fn default() -> Self {
+        Self {
+            client_rules: HashMap::new(),
+        }
+    }
+}
+
+impl DeshredTransactionFilterGateInner {
+    fn build_merged(&self) -> Arc<Vec<DeshredTransactionFilterRule>> {
+        let total_rules = self
+            .client_rules
+            .values()
+            .map(|rules| rules.len())
+            .sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in self.client_rules.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        Arc::new(merged)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeshredTransactionFilterGate {
+    inner: Arc<RwLock<DeshredTransactionFilterGateInner>>,
+    merged_rules: Arc<ArcSwap<Vec<DeshredTransactionFilterRule>>>,
+}
+
+impl Default for DeshredTransactionFilterGate {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(DeshredTransactionFilterGateInner::default())),
+            merged_rules: Arc::new(ArcSwap::from_pointee(Vec::new())),
+        }
+    }
+}
+
+impl DeshredTransactionFilterGate {
+    pub fn update_client_rules(&self, client_id: usize, rules: Vec<DeshredTransactionFilterRule>) {
+        let merged = {
+            let mut inner = match self.inner.write() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if rules.is_empty() {
+                inner.client_rules.remove(&client_id);
+            } else {
+                inner.client_rules.insert(client_id, rules.into());
+            }
+            inner.build_merged()
+        };
+        self.merged_rules.store(merged);
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let merged = {
+            let mut inner = match self.inner.write() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            if inner.client_rules.remove(&client_id).is_some() {
+                inner.build_merged()
+            } else {
+                return;
+            }
+        };
+        self.merged_rules.store(merged);
+    }
+
+    pub fn allows(&self, tx_info: &ReplicaDeshredTransactionInfo<'_>) -> bool {
+        let rules = self.merged_rules.load_full();
+
+        if rules.is_empty() {
+            return false;
+        }
+
+        let account_keys = DeshredTxAccountKeysView::new(tx_info);
+        rules
+            .iter()
+            .any(|rule| rule.matches_prepared(tx_info.is_vote, &account_keys))
+    }
+
+    #[cfg(test)]
+    fn allows_message(&self, message: &MessageDeshredTransaction) -> bool {
+        let rules = self.merged_rules.load_full();
+
+        if rules.is_empty() {
+            return false;
+        }
+
+        rules.iter().any(|rule| {
+            if let Some(expected_vote) = rule.vote {
+                if expected_vote != message.transaction.is_vote {
+                    return false;
+                }
+            }
+
+            if !rule.account_include_set.is_empty()
+                && !message
+                    .transaction
+                    .all_account_keys()
+                    .any(|key| rule.account_include_set.contains(key))
+            {
+                return false;
+            }
+
+            if !rule.account_exclude_set.is_empty()
+                && message
+                    .transaction
+                    .all_account_keys()
+                    .any(|key| rule.account_exclude_set.contains(key))
+            {
+                return false;
+            }
+
+            if !rule.account_required_set.is_empty() {
+                let all_keys: HashSet<&Pubkey> = message.transaction.all_account_keys().collect();
+                if !rule
+                    .account_required_set
+                    .iter()
+                    .all(|key| all_keys.contains(key))
+                {
+                    return false;
+                }
+            }
+
+            true
+        })
     }
 }
 
@@ -1322,6 +1564,14 @@ impl FilterDeshredTransactions {
         Ok(Self { filters })
     }
 
+    fn collect_rules(&self, rules: &mut Vec<DeshredTransactionFilterRule>) {
+        rules.extend(
+            self.filters
+                .values()
+                .map(DeshredTransactionFilterRule::from_inner),
+        );
+    }
+
     pub fn get_updates(&self, message: &MessageDeshredTransaction) -> FilteredUpdatesDeshred {
         let filters = self
             .filters
@@ -1407,6 +1657,12 @@ impl DeshredFilter {
             Message::DeshredTransaction(message) => self.deshred_transactions.get_updates(message),
             _ => FilteredUpdatesDeshred::new(),
         }
+    }
+
+    pub fn get_deshred_transaction_filter_rules(&self) -> Vec<DeshredTransactionFilterRule> {
+        let mut rules = Vec::with_capacity(self.deshred_transactions.filters.len());
+        self.deshred_transactions.collect_rules(&mut rules);
+        rules
     }
 
     pub fn get_pong_msg(&self) -> Option<FilteredUpdateDeshred> {
@@ -2502,6 +2758,298 @@ mod tests {
         let filter2 =
             DeshredFilter::new(&config_no_ping, &limit, &mut create_filter_names()).unwrap();
         assert!(filter2.get_pong_msg().is_none());
+    }
+
+    #[test]
+    fn test_deshred_gate_without_rules_rejects() {
+        let keypair = Keypair::new();
+        let message = create_message_deshred_transaction(
+            &keypair,
+            vec![keypair.pubkey()],
+            vec![],
+            vec![],
+            false,
+        );
+
+        let gate = DeshredTransactionFilterGate::default();
+        assert!(!gate.allows_message(&message));
+    }
+
+    #[test]
+    fn test_deshred_gate_vote_match_and_miss() {
+        let keypair = Keypair::new();
+        let pubkey = keypair.pubkey();
+        let mut deshred_transactions = HashMap::new();
+        deshred_transactions.insert(
+            "votes".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: Some(true),
+                account_include: vec![],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+        );
+
+        let filter = DeshredFilter::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions,
+                ping: None,
+            },
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .unwrap();
+        let gate = DeshredTransactionFilterGate::default();
+        gate.update_client_rules(1, filter.get_deshred_transaction_filter_rules());
+
+        assert!(gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![pubkey],
+            vec![],
+            vec![],
+            true,
+        )));
+        assert!(!gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![pubkey],
+            vec![],
+            vec![],
+            false,
+        )));
+    }
+
+    #[test]
+    fn test_deshred_gate_account_include_static_and_loaded() {
+        let keypair = Keypair::new();
+        let key_a = keypair.pubkey();
+        let key_static = Pubkey::new_unique();
+        let key_loaded = Pubkey::new_unique();
+        let mut deshred_transactions = HashMap::new();
+        deshred_transactions.insert(
+            "f1".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: None,
+                account_include: vec![key_static.to_string(), key_loaded.to_string()],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+        );
+
+        let filter = DeshredFilter::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions,
+                ping: None,
+            },
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .unwrap();
+        let gate = DeshredTransactionFilterGate::default();
+        gate.update_client_rules(1, filter.get_deshred_transaction_filter_rules());
+
+        assert!(gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_static],
+            vec![],
+            vec![],
+            false,
+        )));
+        assert!(gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a],
+            vec![key_loaded],
+            vec![],
+            false,
+        )));
+        assert!(!gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a],
+            vec![],
+            vec![],
+            false,
+        )));
+    }
+
+    #[test]
+    fn test_deshred_gate_account_exclude_and_required() {
+        let keypair = Keypair::new();
+        let key_a = keypair.pubkey();
+        let key_b = Pubkey::new_unique();
+        let key_c = Pubkey::new_unique();
+        let mut exclude_filters = HashMap::new();
+        exclude_filters.insert(
+            "exclude".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: None,
+                account_include: vec![],
+                account_exclude: vec![key_b.to_string()],
+                account_required: vec![],
+            },
+        );
+        let exclude_filter = DeshredFilter::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions: exclude_filters,
+                ping: None,
+            },
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .unwrap();
+        let exclude_gate = DeshredTransactionFilterGate::default();
+        exclude_gate.update_client_rules(1, exclude_filter.get_deshred_transaction_filter_rules());
+
+        assert!(
+            !exclude_gate.allows_message(&create_message_deshred_transaction(
+                &keypair,
+                vec![key_a, key_b],
+                vec![],
+                vec![],
+                false,
+            ))
+        );
+        assert!(
+            exclude_gate.allows_message(&create_message_deshred_transaction(
+                &keypair,
+                vec![key_a],
+                vec![],
+                vec![],
+                false,
+            ))
+        );
+
+        let mut required_filters = HashMap::new();
+        required_filters.insert(
+            "required".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: None,
+                account_include: vec![],
+                account_exclude: vec![],
+                account_required: vec![key_b.to_string(), key_c.to_string()],
+            },
+        );
+        let required_filter = DeshredFilter::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions: required_filters,
+                ping: None,
+            },
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .unwrap();
+        let required_gate = DeshredTransactionFilterGate::default();
+        required_gate
+            .update_client_rules(1, required_filter.get_deshred_transaction_filter_rules());
+
+        assert!(
+            required_gate.allows_message(&create_message_deshred_transaction(
+                &keypair,
+                vec![key_a, key_b],
+                vec![key_c],
+                vec![],
+                false,
+            ))
+        );
+        assert!(
+            !required_gate.allows_message(&create_message_deshred_transaction(
+                &keypair,
+                vec![key_a, key_b],
+                vec![],
+                vec![],
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn test_deshred_gate_merges_and_removes_client_rules() {
+        let keypair = Keypair::new();
+        let key_a = keypair.pubkey();
+        let key_b = Pubkey::new_unique();
+        let key_c = Pubkey::new_unique();
+
+        let mut filter_one = HashMap::new();
+        filter_one.insert(
+            "one".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: Some(true),
+                account_include: vec![],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+        );
+        let filter_one = DeshredFilter::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions: filter_one,
+                ping: None,
+            },
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .unwrap();
+
+        let mut filter_two = HashMap::new();
+        filter_two.insert(
+            "two".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: None,
+                account_include: vec![key_b.to_string()],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+        );
+        let filter_two = DeshredFilter::new(
+            &SubscribeDeshredRequest {
+                deshred_transactions: filter_two,
+                ping: None,
+            },
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .unwrap();
+
+        let gate = DeshredTransactionFilterGate::default();
+        gate.update_client_rules(1, filter_one.get_deshred_transaction_filter_rules());
+        gate.update_client_rules(2, filter_two.get_deshred_transaction_filter_rules());
+
+        assert!(gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a],
+            vec![],
+            vec![],
+            true,
+        )));
+        assert!(gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_b],
+            vec![],
+            vec![],
+            false,
+        )));
+
+        gate.remove_client(1);
+        assert!(!gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a],
+            vec![],
+            vec![],
+            true,
+        )));
+        assert!(gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_b],
+            vec![],
+            vec![],
+            false,
+        )));
+
+        gate.remove_client(2);
+        assert!(!gate.allows_message(&create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_b],
+            vec![key_c],
+            vec![],
+            false,
+        )));
     }
 
     #[test]

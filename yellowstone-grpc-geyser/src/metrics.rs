@@ -193,6 +193,16 @@ lazy_static::lazy_static! {
         "account_early_filter_drop_total",
         "Number of accounts dropped by early account filter"
     ).unwrap();
+
+    static ref DESHRED_TX_EARLY_FILTER_PASS_TOTAL: IntCounter = IntCounter::new(
+        "deshred_tx_early_filter_pass_total",
+        "Number of deshred transactions passed by early deshred filter"
+    ).unwrap();
+
+    static ref DESHRED_TX_EARLY_FILTER_DROP_TOTAL: IntCounter = IntCounter::new(
+        "deshred_tx_early_filter_drop_total",
+        "Number of deshred transactions dropped by early deshred filter"
+    ).unwrap();
 }
 
 #[derive(Debug)]
@@ -651,6 +661,14 @@ pub fn account_early_filter_drop_inc() {
     ACCOUNT_EARLY_FILTER_DROP_TOTAL.inc();
 }
 
+pub fn deshred_tx_early_filter_pass_inc() {
+    DESHRED_TX_EARLY_FILTER_PASS_TOTAL.inc();
+}
+
+pub fn deshred_tx_early_filter_drop_inc() {
+    DESHRED_TX_EARLY_FILTER_DROP_TOTAL.inc();
+}
+
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
 pub fn reset_metrics() {
     // Reset gauge metrics to 0
@@ -680,6 +698,8 @@ pub fn reset_metrics() {
     TX_EARLY_FILTER_DROP_TOTAL.reset();
     ACCOUNT_EARLY_FILTER_PASS_TOTAL.reset();
     ACCOUNT_EARLY_FILTER_DROP_TOTAL.reset();
+    DESHRED_TX_EARLY_FILTER_PASS_TOTAL.reset();
+    DESHRED_TX_EARLY_FILTER_DROP_TOTAL.reset();
 
     // Pre-encoding
     PRE_ENCODED_CACHE_HIT.reset();

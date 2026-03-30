@@ -12,7 +12,8 @@ use {
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateDeshred, FilteredUpdateOneof},
                 name::FilterNames,
-                AccountFilterGate, DeshredFilter, Filter, TransactionFilterGate,
+                AccountFilterGate, DeshredFilter, DeshredTransactionFilterGate, Filter,
+                TransactionFilterGate,
             },
             message::{
                 CommitmentLevel, Message, MessageBlock, MessageBlockMeta, MessageEntry,
@@ -579,6 +580,7 @@ pub struct GrpcService {
     active_slots_subscriptions: Arc<AtomicUsize>,
     account_filter_gate: AccountFilterGate,
     tx_filter_gate: TransactionFilterGate,
+    deshred_tx_filter_gate: DeshredTransactionFilterGate,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
     cancellation_token: CancellationToken,
@@ -596,6 +598,7 @@ impl GrpcService {
         parallel_encoder: ParallelEncoder,
         account_filter_gate: AccountFilterGate,
         tx_filter_gate: TransactionFilterGate,
+        deshred_tx_filter_gate: DeshredTransactionFilterGate,
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
@@ -712,6 +715,7 @@ impl GrpcService {
             active_slots_subscriptions: Arc::clone(&active_slots_subscriptions),
             account_filter_gate,
             tx_filter_gate,
+            deshred_tx_filter_gate,
             debug_clients_tx,
             filter_names,
             cancellation_token: service_cancellation_token.clone(),
@@ -1706,7 +1710,6 @@ impl GrpcService {
         result
     }
 
-
     #[allow(clippy::too_many_arguments)]
     async fn deshred_client_loop(
         id: usize,
@@ -1714,6 +1717,7 @@ impl GrpcService {
         stream_tx: LoadAwareSender<TonicResult<FilteredUpdateDeshred>>,
         mut client_rx: mpsc::UnboundedReceiver<Option<DeshredFilter>>,
         mut messages_rx: broadcast::Receiver<BroadcastedMessage>,
+        deshred_tx_filter_gate: DeshredTransactionFilterGate,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
@@ -1752,6 +1756,10 @@ impl GrpcService {
 
                     match message {
                         Some(Some(filter_new)) => {
+                            deshred_tx_filter_gate.update_client_rules(
+                                id,
+                                filter_new.get_deshred_transaction_filter_rules(),
+                            );
                             session.filter = filter_new;
                             info!("deshred client #{id}: filter updated");
                         }
@@ -1811,9 +1819,9 @@ impl GrpcService {
                 }
             }
         }
+        deshred_tx_filter_gate.remove_client(id);
         // session Drop handles: queue_size(0), disconnect metric, debug removal, cancel, log
     }
-
 }
 
 #[tonic::async_trait]
@@ -2124,6 +2132,7 @@ impl Geyser for GrpcService {
             stream_tx,
             client_rx,
             self.broadcast_tx.subscribe(),
+            self.deshred_tx_filter_gate.clone(),
             self.debug_clients_tx.clone(),
             client_cancellation_token,
             self.task_tracker.clone(),
