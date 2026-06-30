@@ -299,6 +299,15 @@ pub struct ConfigGrpc {
         deserialize_with = "deserialize_int_str"
     )]
     pub channel_capacity: usize,
+    /// Number of processed messages to batch before broadcasting.
+    #[serde(
+        default = "ConfigGrpc::processed_messages_max_default",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub processed_messages_max: usize,
+    /// Drop transaction log messages from streamed TransactionStatusMeta.
+    #[serde(default)]
+    pub strip_transaction_log_messages: bool,
     /// Concurrency limit for unary requests
     #[serde(
         default = "ConfigGrpc::unary_concurrency_limit_default",
@@ -420,6 +429,10 @@ impl ConfigGrpc {
 
     const fn channel_capacity_default() -> usize {
         250_000
+    }
+
+    const fn processed_messages_max_default() -> usize {
+        31
     }
 
     const fn unary_concurrency_limit_default() -> usize {
@@ -666,5 +679,30 @@ mod tests {
         let json = r#""not_valid""#;
         let result: Result<GrpcAddresses, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_grpc_performance_defaults() {
+        let json = r#"{"address": "127.0.0.1:10000"}"#;
+        let config: super::ConfigGrpc = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.processed_messages_max, 31);
+        assert_eq!(config.replay_stored_slots, 150);
+        assert!(!config.strip_transaction_log_messages);
+    }
+
+    #[test]
+    fn test_grpc_performance_options() {
+        let json = r#"{
+            "address": "127.0.0.1:10000",
+            "processed_messages_max": "64",
+            "replay_stored_slots": "0",
+            "strip_transaction_log_messages": true
+        }"#;
+        let config: super::ConfigGrpc = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.processed_messages_max, 64);
+        assert_eq!(config.replay_stored_slots, 0);
+        assert!(config.strip_transaction_log_messages);
     }
 }

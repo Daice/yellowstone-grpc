@@ -13,7 +13,8 @@ use {
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateDeshred, FilteredUpdateOneof},
                 name::FilterNames,
-                DeshredFilter, Filter,
+                AccountFilterGate, DeshredFilter, DeshredTransactionFilterGate, Filter,
+                TransactionFilterGate,
             },
             message::{CommitmentLevel, Message, MessageBlockMeta, MessageSlot, SlotStatus},
             proto::geyser_server::{Geyser, GeyserServer},
@@ -524,6 +525,69 @@ impl Drop for AutoClosableUnixListenerStream {
     }
 }
 
+struct FilterGateGuard {
+    client_id: usize,
+    account_filter_gate: AccountFilterGate,
+    transaction_filter_gate: TransactionFilterGate,
+}
+
+impl FilterGateGuard {
+    fn new(
+        client_id: usize,
+        account_filter_gate: AccountFilterGate,
+        transaction_filter_gate: TransactionFilterGate,
+    ) -> Self {
+        Self {
+            client_id,
+            account_filter_gate,
+            transaction_filter_gate,
+        }
+    }
+
+    fn update(&self, filter: &Filter) {
+        self.account_filter_gate
+            .update_client(self.client_id, filter);
+        self.transaction_filter_gate
+            .update_client(self.client_id, filter);
+    }
+}
+
+impl Drop for FilterGateGuard {
+    fn drop(&mut self) {
+        self.account_filter_gate.remove_client(self.client_id);
+        self.transaction_filter_gate.remove_client(self.client_id);
+    }
+}
+
+struct DeshredFilterGateGuard {
+    client_id: usize,
+    deshred_transaction_filter_gate: DeshredTransactionFilterGate,
+}
+
+impl DeshredFilterGateGuard {
+    fn new(
+        client_id: usize,
+        deshred_transaction_filter_gate: DeshredTransactionFilterGate,
+    ) -> Self {
+        Self {
+            client_id,
+            deshred_transaction_filter_gate,
+        }
+    }
+
+    fn update(&self, filter: &DeshredFilter) {
+        self.deshred_transaction_filter_gate
+            .update_client(self.client_id, filter);
+    }
+}
+
+impl Drop for DeshredFilterGateGuard {
+    fn drop(&mut self) {
+        self.deshred_transaction_filter_gate
+            .remove_client(self.client_id);
+    }
+}
+
 enum Listener {
     Tcp(TritonTcpIncoming),
     Tls(TlsIncoming),
@@ -558,6 +622,9 @@ pub struct GrpcService {
     subscription_tracker: SubscriptionTracker,
     blocks_meta: Option<Arc<BlockMetaStorage>>,
     subscribe_id: Arc<AtomicUsize>,
+    account_filter_gate: AccountFilterGate,
+    transaction_filter_gate: TransactionFilterGate,
+    deshred_transaction_filter_gate: DeshredTransactionFilterGate,
     snapshot_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>>,
     broadcast_tx: broadcast::Sender<BroadcastedMessage>,
     deshred_broadcast_tx: broadcast::Sender<DeshredBroadcastedMessage>,
@@ -622,6 +689,9 @@ impl GrpcService {
         is_reload: bool,
         service_cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
+        account_filter_gate: AccountFilterGate,
+        transaction_filter_gate: TransactionFilterGate,
+        deshred_transaction_filter_gate: DeshredTransactionFilterGate,
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
@@ -804,6 +874,9 @@ impl GrpcService {
                 let (tx, rx) = mpsc::channel(1);
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
+        let replay_stored_slots = config.replay_stored_slots;
+        let processed_messages_max = config.processed_messages_max.max(1);
+        let skip_reconstruction = replay_stored_slots == 0;
 
         // Capture traffic reporting threshold before config is moved
         let traffic_reporting_threshold = config
@@ -828,6 +901,9 @@ impl GrpcService {
             subscription_tracker: Arc::new(StdMutex::new(HashMap::new())),
             blocks_meta: blocks_meta.map(Arc::new),
             subscribe_id: Arc::new(AtomicUsize::new(0)),
+            account_filter_gate,
+            transaction_filter_gate,
+            deshred_transaction_filter_gate,
             snapshot_rx: Arc::new(Mutex::new(snapshot_rx)),
             broadcast_tx: broadcast_tx.clone(),
             deshred_broadcast_tx: deshred_broadcast_tx.clone(),
@@ -850,34 +926,51 @@ impl GrpcService {
 
         // Run geyser message loop
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
-        let (block_reconstruction_tx, block_reconstruction_rx) = mpsc::unbounded_channel();
+        let (block_reconstruction_tx, block_reconstruction_rx) = if skip_reconstruction {
+            (None, None)
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        };
 
         // Warn if replay buffer is too small for auto-reconnect
-        if config.replay_stored_slots < 150 {
+        if !skip_reconstruction && replay_stored_slots < 150 {
             log::warn!(
                 "replay_stored_slots={} may be too low for auto-reconnect; recommend >= 150",
-                config.replay_stored_slots
+                replay_stored_slots
             );
         }
 
-        {
-            let broadcast_tx = broadcast_tx.clone();
+        if skip_reconstruction {
             task_tracker.spawn(async move {
-                Self::block_reconstruction_loop(
-                    block_reconstruction_rx,
-                    blocks_meta_tx,
-                    broadcast_tx,
-                    replay_stored_slots_rx,
-                    replay_first_available_slot,
-                    config.replay_stored_slots,
-                )
-                .await;
+                Self::geyser_processed_loop(messages_rx, broadcast_tx, processed_messages_max)
+                    .await;
+            });
+        } else {
+            let block_reconstruction_rx = block_reconstruction_rx
+                .expect("block reconstruction receiver must exist when reconstruction is enabled");
+            let block_reconstruction_tx = block_reconstruction_tx
+                .expect("block reconstruction sender must exist when reconstruction is enabled");
+
+            {
+                let broadcast_tx = broadcast_tx.clone();
+                task_tracker.spawn(async move {
+                    Self::block_reconstruction_loop(
+                        block_reconstruction_rx,
+                        blocks_meta_tx,
+                        broadcast_tx,
+                        replay_stored_slots_rx,
+                        replay_first_available_slot,
+                        replay_stored_slots,
+                    )
+                    .await;
+                });
+            }
+
+            task_tracker.spawn(async move {
+                Self::geyser_loop(messages_rx, broadcast_tx, block_reconstruction_tx).await;
             });
         }
-
-        task_tracker.spawn(async move {
-            Self::geyser_loop(messages_rx, broadcast_tx, block_reconstruction_tx).await;
-        });
 
         // Health check service
         let (health_reporter, health_service) = health_reporter();
@@ -1120,6 +1213,49 @@ impl GrpcService {
         }
     }
 
+    async fn geyser_processed_loop(
+        mut messages_rx: mpsc::UnboundedReceiver<Message>,
+        broadcast_tx: broadcast::Sender<BroadcastedMessage>,
+        processed_messages_max: usize,
+    ) {
+        let processed_messages_max = processed_messages_max.max(1);
+        let mut processed_messages = Vec::with_capacity(processed_messages_max);
+
+        while let Some(message) = messages_rx.recv().await {
+            metrics::message_queue_size_dec();
+            processed_messages.push(message);
+
+            while let Ok(message) = messages_rx.try_recv() {
+                metrics::message_queue_size_dec();
+                processed_messages.push(message);
+                if processed_messages.len() >= processed_messages_max {
+                    break;
+                }
+            }
+
+            for message in processed_messages.iter() {
+                match message {
+                    Message::Slot(slot_message) => {
+                        metrics::update_slot_plugin_status(slot_message.status, slot_message.slot);
+                    }
+                    Message::Block(_) => {
+                        unreachable!("Block message should not be sent by plugin directly, it is constructed in geyser loop after receiving all necessary messages for the slot and then broadcasted to subscribers");
+                    }
+                    _ => {}
+                }
+            }
+
+            encode_messages(&processed_messages);
+            GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+
+            let messages = Arc::new(processed_messages);
+            let _ = broadcast_tx.send((CommitmentLevel::Processed, messages));
+            processed_messages = Vec::with_capacity(processed_messages_max);
+        }
+
+        info!("Geyser processed loop: messages channel closed");
+    }
+
     async fn block_reconstruction_loop(
         mut messages_rx: mpsc::UnboundedReceiver<Arc<Vec<Message>>>,
         blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
@@ -1276,6 +1412,8 @@ impl GrpcService {
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
         subscription_tracker: SubscriptionTracker,
+        account_filter_gate: AccountFilterGate,
+        transaction_filter_gate: TransactionFilterGate,
     ) {
         let mut session = ClientSession::new(
             id,
@@ -1287,6 +1425,7 @@ impl GrpcService {
             subscription_tracker,
         );
         let cancellation_token = session.cancellation_token.clone();
+        let filter_gate = FilterGateGuard::new(id, account_filter_gate, transaction_filter_gate);
 
         if let Some(snapshot_rx) = snapshot_rx.take() {
             info!("client #{id}: snapshot requested");
@@ -1297,6 +1436,7 @@ impl GrpcService {
                 &mut client_rx,
                 snapshot_rx,
                 &mut session.filter,
+                &filter_gate,
                 cancellation_token.clone(),
             )
             .await;
@@ -1348,6 +1488,7 @@ impl GrpcService {
 
                     match message {
                         Some(Some((from_slot, filter_new))) => {
+                            filter_gate.update(&filter_new);
                             session.set_filter(filter_new);
                             info!("client #{id}: filter updated");
 
@@ -1482,6 +1623,7 @@ impl GrpcService {
         client_rx: &mut mpsc::UnboundedReceiver<Option<(Option<u64>, Filter)>>,
         snapshot_rx: crossbeam_channel::Receiver<Box<Message>>,
         filter: &mut Filter,
+        filter_gate: &FilterGateGuard,
         cancellation_token: CancellationToken,
     ) -> Result<(), ClientSnapshotReplayError> {
         info!("client #{id}: going to receive snapshot data");
@@ -1504,6 +1646,7 @@ impl GrpcService {
                                 continue;
                             }
 
+                            filter_gate.update(&filter_new);
                             metrics::update_subscriptions(endpoint, Some(filter), Some(&filter_new));
                             *filter = filter_new;
                             info!("client #{id}: filter updated");
@@ -1613,6 +1756,7 @@ impl GrpcService {
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
+        deshred_transaction_filter_gate: DeshredTransactionFilterGate,
     ) {
         let mut session = DeshredClientSession::new(
             id,
@@ -1620,6 +1764,7 @@ impl GrpcService {
             debug_client_tx,
             cancellation_token.clone(),
         );
+        let filter_gate = DeshredFilterGateGuard::new(id, deshred_transaction_filter_gate);
 
         'outer: loop {
             set_subscriber_queue_size(&session.subscriber_id, stream_tx.queue_size());
@@ -1648,6 +1793,7 @@ impl GrpcService {
 
                     match message {
                         Some(Some(filter_new)) => {
+                            filter_gate.update(&filter_new);
                             session.filter = filter_new;
                             info!("deshred client #{id}: filter updated");
                         }
@@ -1900,6 +2046,8 @@ impl Geyser for GrpcService {
             client_cancellation_token,
             self.task_tracker.clone(),
             Arc::clone(&self.subscription_tracker),
+            self.account_filter_gate.clone(),
+            self.transaction_filter_gate.clone(),
         ));
 
         Ok(Response::new(stream_rx))
@@ -2020,6 +2168,7 @@ impl Geyser for GrpcService {
             self.debug_clients_tx.clone(),
             client_cancellation_token,
             self.task_tracker.clone(),
+            self.deshred_transaction_filter_gate.clone(),
         ));
 
         Ok(Response::new(stream_rx))
@@ -2139,10 +2288,19 @@ mod tests {
     use {
         super::*,
         crate::{
-            plugin::filter::{limits::FilterLimits, name::FilterNames, Filter},
+            plugin::{
+                filter::{limits::FilterLimits, name::FilterNames, DeshredFilter, Filter},
+                message::{MessageDeshredTransaction, MessageDeshredTransactionInfo},
+            },
             util::stream::load_aware_channel,
         },
-        yellowstone_grpc_proto::prelude::{SubscribeRequest, SubscribeRequestFilterSlots},
+        foldhash::HashSet as FoldHashSet,
+        solana_pubkey::Pubkey,
+        solana_signature::Signature,
+        yellowstone_grpc_proto::prelude::{
+            SubscribeDeshredRequest, SubscribeRequest, SubscribeRequestFilterDeshredTransactions,
+            SubscribeRequestFilterSlots, SubscribeUpdateBlockMeta,
+        },
     };
 
     fn create_filter_with_slots() -> Filter {
@@ -2152,6 +2310,44 @@ mod tests {
         };
         let mut names = FilterNames::new(64, 1024, Duration::from_secs(1));
         Filter::new(&config, &FilterLimits::default(), &mut names).unwrap()
+    }
+
+    fn create_deshred_filter_with_account(account: Pubkey) -> DeshredFilter {
+        let config = SubscribeDeshredRequest {
+            deshred_transactions: HashMap::from([(
+                "test".into(),
+                SubscribeRequestFilterDeshredTransactions {
+                    vote: None,
+                    account_include: vec![account.to_string()],
+                    account_exclude: vec![],
+                    account_required: vec![],
+                },
+            )]),
+            ping: None,
+            slots: HashMap::new(),
+        };
+        let mut names = FilterNames::new(64, 1024, Duration::from_secs(1));
+        DeshredFilter::new(&config, &FilterLimits::default(), &mut names).unwrap()
+    }
+
+    fn create_deshred_message_with_account(account: Pubkey) -> MessageDeshredTransaction {
+        let mut static_account_keys = FoldHashSet::default();
+        static_account_keys.insert(account);
+
+        MessageDeshredTransaction {
+            transaction: Arc::new(MessageDeshredTransactionInfo {
+                signature: Signature::from([0; 64]),
+                is_vote: false,
+                transaction: Default::default(),
+                static_account_keys,
+                loaded_writable_addresses: vec![],
+                loaded_readonly_addresses: vec![],
+                completed_data_set_starting_shred_index: 0,
+                completed_data_set_ending_shred_index_exclusive: 0,
+            }),
+            slot: 100,
+            created_at: Timestamp::from(SystemTime::now()),
+        }
     }
 
     // Simulates the incoming handler task from subscribe(). Mirrors the
@@ -2218,6 +2414,8 @@ mod tests {
             ct.clone(),
             tt.clone(),
             Arc::clone(&st),
+            AccountFilterGate::default(),
+            TransactionFilterGate::default(),
         ));
 
         // yield so incoming_handler sends the filter and client_loop
@@ -2247,6 +2445,52 @@ mod tests {
             .expect("client_loop panicked");
 
         assert!(ct.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_deshred_client_loop_updates_filter_gate() {
+        let account = Pubkey::new_unique();
+        let filter = create_deshred_filter_with_account(account);
+        let message = create_deshred_message_with_account(account);
+        let gate = DeshredTransactionFilterGate::default();
+        let ct = CancellationToken::new();
+        let tt = TaskTracker::new();
+        let (stream_tx, _stream_rx) = load_aware_channel(16);
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (_broadcast_tx, broadcast_rx) = broadcast::channel::<DeshredBroadcastedMessage>(16);
+
+        let handle = tokio::spawn(GrpcService::deshred_client_loop(
+            0,
+            Some("test".into()),
+            stream_tx,
+            client_rx,
+            broadcast_rx,
+            None,
+            ct,
+            tt,
+            gate.clone(),
+        ));
+
+        assert!(!gate.allows_message(&message));
+        client_tx.send(Some(filter)).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if gate.allows_message(&message) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deshred filter gate was not updated");
+
+        client_tx.send(None).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("deshred_client_loop did not exit")
+            .expect("deshred_client_loop panicked");
+        assert!(!gate.allows_message(&message));
     }
 
     #[tokio::test]
@@ -2485,5 +2729,97 @@ mod tests {
         }
         // drop fires but "UNKNOWN" was never in the tracker, so nothing changes
         assert!(tracker.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_geyser_processed_loop_broadcasts_block_meta_directly() {
+        let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+        let (broadcast_tx, mut broadcast_rx) = broadcast::channel::<BroadcastedMessage>(16);
+
+        let handle = tokio::spawn(GrpcService::geyser_processed_loop(
+            messages_rx,
+            broadcast_tx,
+            31,
+        ));
+
+        messages_tx
+            .send(Message::BlockMeta(Arc::new(
+                MessageBlockMeta::from_update_oneof(
+                    SubscribeUpdateBlockMeta {
+                        slot: 100,
+                        parent_slot: 99,
+                        ..Default::default()
+                    },
+                    Timestamp::from(SystemTime::now()),
+                ),
+            )))
+            .unwrap();
+        messages_tx
+            .send(Message::Slot(MessageSlot {
+                slot: 100,
+                parent: Some(99),
+                status: SlotStatus::Processed,
+                dead_error: None,
+                created_at: Timestamp::from(SystemTime::now()),
+            }))
+            .unwrap();
+        drop(messages_tx);
+
+        let (commitment, messages) =
+            tokio::time::timeout(Duration::from_secs(2), broadcast_rx.recv())
+                .await
+                .expect("processed broadcast timed out")
+                .expect("processed broadcast closed");
+        assert_eq!(commitment, CommitmentLevel::Processed);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(messages.first(), Some(Message::BlockMeta(meta)) if meta.slot == 100));
+        assert!(matches!(messages.get(1), Some(Message::Slot(slot)) if slot.slot == 100));
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("geyser_processed_loop did not exit")
+            .expect("geyser_processed_loop panicked");
+    }
+
+    #[tokio::test]
+    async fn test_geyser_loop_keeps_reconstruction_when_bypass_is_disabled() {
+        let (messages_tx, messages_rx) = mpsc::unbounded_channel();
+        let (broadcast_tx, _broadcast_rx) = broadcast::channel::<BroadcastedMessage>(16);
+        let (block_reconstruction_tx, mut block_reconstruction_rx) = mpsc::unbounded_channel();
+
+        let handle = tokio::spawn(GrpcService::geyser_loop(
+            messages_rx,
+            broadcast_tx,
+            block_reconstruction_tx,
+        ));
+
+        messages_tx
+            .send(Message::Slot(MessageSlot {
+                slot: 100,
+                parent: Some(99),
+                status: SlotStatus::Processed,
+                dead_error: None,
+                created_at: Timestamp::from(SystemTime::now()),
+            }))
+            .unwrap();
+        drop(messages_tx);
+
+        let reconstructed = loop {
+            let messages =
+                tokio::time::timeout(Duration::from_secs(2), block_reconstruction_rx.recv())
+                    .await
+                    .expect("reconstruction message timed out")
+                    .expect("reconstruction channel closed");
+            if !messages.is_empty() {
+                break messages;
+            }
+        };
+        assert_eq!(reconstructed.len(), 1);
+        assert!(matches!(reconstructed.first(), Some(Message::Slot(_))));
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("geyser_loop did not exit")
+            .expect("geyser_loop panicked");
     }
 }

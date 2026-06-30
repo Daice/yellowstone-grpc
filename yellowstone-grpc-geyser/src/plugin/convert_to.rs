@@ -106,6 +106,13 @@ pub fn create_lookup(lookup: &MessageAddressTableLookup) -> proto::MessageAddres
 }
 
 pub fn create_transaction_meta(meta: &TransactionStatusMeta) -> proto::TransactionStatusMeta {
+    create_transaction_meta_with_config(meta, false)
+}
+
+pub fn create_transaction_meta_with_config(
+    meta: &TransactionStatusMeta,
+    strip_log_messages: bool,
+) -> proto::TransactionStatusMeta {
     let TransactionStatusMeta {
         status,
         fee,
@@ -127,8 +134,12 @@ pub fn create_transaction_meta(meta: &TransactionStatusMeta) -> proto::Transacti
         .as_deref()
         .map(create_inner_instructions_vec)
         .unwrap_or_default();
-    let log_messages_none = log_messages.is_none();
-    let log_messages = log_messages.clone().unwrap_or_default();
+    let log_messages_none = strip_log_messages || log_messages.is_none();
+    let log_messages = if strip_log_messages {
+        Vec::new()
+    } else {
+        log_messages.clone().unwrap_or_default()
+    };
     let pre_token_balances = pre_token_balances
         .as_deref()
         .map(create_token_balances)
@@ -269,4 +280,47 @@ pub const fn create_block_height(block_height: u64) -> proto::BlockHeight {
 
 pub const fn create_timestamp(timestamp: UnixTimestamp) -> proto::UnixTimestamp {
     proto::UnixTimestamp { timestamp }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{create_transaction_meta, create_transaction_meta_with_config},
+        solana_message::v0::LoadedAddresses,
+        solana_transaction_status::TransactionStatusMeta,
+    };
+
+    fn meta_with_logs() -> TransactionStatusMeta {
+        TransactionStatusMeta {
+            status: Ok(()),
+            fee: 0,
+            pre_balances: Vec::new(),
+            post_balances: Vec::new(),
+            inner_instructions: None,
+            log_messages: Some(vec!["program log".to_owned()]),
+            pre_token_balances: None,
+            post_token_balances: None,
+            rewards: None,
+            loaded_addresses: LoadedAddresses::default(),
+            return_data: None,
+            compute_units_consumed: None,
+            cost_units: None,
+        }
+    }
+
+    #[test]
+    fn transaction_meta_keeps_logs_by_default() {
+        let converted = create_transaction_meta(&meta_with_logs());
+
+        assert_eq!(converted.log_messages, vec!["program log"]);
+        assert!(!converted.log_messages_none);
+    }
+
+    #[test]
+    fn transaction_meta_can_strip_logs() {
+        let converted = create_transaction_meta_with_config(&meta_with_logs(), true);
+
+        assert!(converted.log_messages.is_empty());
+        assert!(converted.log_messages_none);
+    }
 }

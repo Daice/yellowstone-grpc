@@ -5757,6 +5757,7 @@ dependencies = [
  "affinity",
  "agave-geyser-plugin-interface",
  "anyhow",
+ "arc-swap",
  "base64",
  "bs58",
  "bytes",

@@ -15,9 +15,15 @@ use {
         },
         message::{
             CommitmentLevel, Message, MessageAccount, MessageBlock, MessageBlockMeta,
-            MessageDeshredTransaction, MessageEntry, MessageSlot, MessageTransaction, SlotStatus,
+            MessageDeshredTransaction, MessageDeshredTransactionInfo, MessageEntry, MessageSlot,
+            MessageTransaction, SlotStatus,
         },
     },
+    agave_geyser_plugin_interface::geyser_plugin_interface::{
+        ReplicaDeshredTransactionInfo, ReplicaDeshredTransactionInfoV2,
+        ReplicaDeshredTransactionInfoVersions, ReplicaTransactionInfoV3,
+    },
+    arc_swap::ArcSwap,
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
     bytes::buf::BufMut,
     foldhash::{HashMap as FoldHashMap, HashMapExt, HashSet as FoldHashSet, HashSetExt},
@@ -31,7 +37,7 @@ use {
         collections::{HashMap, HashSet},
         ops::Range,
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, Mutex as StdMutex},
     },
     yellowstone_grpc_proto::{
         cuckoo::CuckooFilter,
@@ -265,6 +271,492 @@ impl Filter {
         self.ping
             .map(|id| FilteredUpdate::new_empty(FilteredUpdateOneof::pong(id)))
     }
+
+    fn account_filter_rules(&self) -> Vec<AccountFilterRule> {
+        self.accounts.filter_rules()
+    }
+
+    fn transaction_filter_rules(&self) -> Vec<TransactionFilterRule> {
+        self.transactions
+            .filter_rules()
+            .into_iter()
+            .chain(self.transactions_status.filter_rules())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AccountFilterRule {
+    nonempty_txn_signature: Option<bool>,
+    account: FoldHashSet<Pubkey>,
+    account_required: bool,
+    account_cuckoo: Option<Arc<CuckooFilter<[u8; 32]>>>,
+    owner: FoldHashSet<Pubkey>,
+    owner_required: bool,
+}
+
+impl AccountFilterRule {
+    fn matches(&self, pubkey: &Pubkey, owner: &Pubkey, txn_signature_nonempty: bool) -> bool {
+        if let Some(nonempty_txn_signature) = self.nonempty_txn_signature {
+            if nonempty_txn_signature != txn_signature_nonempty {
+                return false;
+            }
+        }
+
+        let has_pubkey = self.account.contains(pubkey)
+            || self
+                .account_cuckoo
+                .as_ref()
+                .is_some_and(|cuckoo| cuckoo.contains(&pubkey.to_bytes()));
+        if (self.account_required || self.account_cuckoo.is_some()) && !has_pubkey {
+            return false;
+        }
+
+        if self.owner_required && !self.owner.contains(owner) {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AccountFilterGate {
+    inner: Arc<AccountFilterGateInner>,
+}
+
+#[derive(Debug)]
+struct AccountFilterGateInner {
+    by_client: StdMutex<HashMap<usize, Vec<AccountFilterRule>>>,
+    merged: ArcSwap<Vec<AccountFilterRule>>,
+}
+
+impl Default for AccountFilterGateInner {
+    fn default() -> Self {
+        Self {
+            by_client: StdMutex::new(HashMap::new()),
+            merged: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+}
+
+impl AccountFilterGate {
+    pub fn update_client(&self, client_id: usize, filter: &Filter) {
+        let rules = filter.account_filter_rules();
+        let mut by_client = self
+            .inner
+            .by_client
+            .lock()
+            .expect("account filter gate mutex poisoned");
+        if rules.is_empty() {
+            by_client.remove(&client_id);
+        } else {
+            by_client.insert(client_id, rules);
+        }
+        self.rebuild_locked(&by_client);
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let mut by_client = self
+            .inner
+            .by_client
+            .lock()
+            .expect("account filter gate mutex poisoned");
+        by_client.remove(&client_id);
+        self.rebuild_locked(&by_client);
+    }
+
+    fn rebuild_locked(&self, by_client: &HashMap<usize, Vec<AccountFilterRule>>) {
+        let total_rules = by_client.values().map(Vec::len).sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in by_client.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        self.inner.merged.store(Arc::new(merged));
+    }
+
+    pub fn allows(&self, pubkey: &Pubkey, owner: &Pubkey, txn_signature_nonempty: bool) -> bool {
+        let rules = self.inner.merged.load();
+        !rules.is_empty()
+            && rules
+                .iter()
+                .any(|rule| rule.matches(pubkey, owner, txn_signature_nonempty))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionFilterRule {
+    vote: Option<bool>,
+    failed: Option<bool>,
+    signature: Option<Signature>,
+    account_include: Vec<Pubkey>,
+    account_exclude: Vec<Pubkey>,
+    account_required: Vec<Pubkey>,
+}
+
+impl TransactionFilterRule {
+    fn matches(
+        &self,
+        is_vote: bool,
+        is_failed: bool,
+        signature: &Signature,
+        account_keys: &TxAccountKeysView<'_>,
+    ) -> bool {
+        if let Some(expected_vote) = self.vote {
+            if expected_vote != is_vote {
+                return false;
+            }
+        }
+
+        if let Some(expected_failed) = self.failed {
+            if expected_failed != is_failed {
+                return false;
+            }
+        }
+
+        if let Some(expected_signature) = &self.signature {
+            if expected_signature != signature {
+                return false;
+            }
+        }
+
+        if !self.account_include.is_empty() && !account_keys.any_in_list(&self.account_include) {
+            return false;
+        }
+
+        if !self.account_exclude.is_empty() && account_keys.any_in_list(&self.account_exclude) {
+            return false;
+        }
+
+        if !self.account_required.is_empty()
+            && !self
+                .account_required
+                .iter()
+                .all(|required| account_keys.contains(required))
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TxAccountKeysView<'a> {
+    static_keys: &'a [Pubkey],
+    loaded_writable: &'a [Pubkey],
+    loaded_readonly: &'a [Pubkey],
+}
+
+impl<'a> TxAccountKeysView<'a> {
+    fn new(tx_info: &'a ReplicaTransactionInfoV3<'_>) -> Self {
+        Self {
+            static_keys: tx_info.transaction.message.static_account_keys(),
+            loaded_writable: &tx_info.transaction_status_meta.loaded_addresses.writable,
+            loaded_readonly: &tx_info.transaction_status_meta.loaded_addresses.readonly,
+        }
+    }
+
+    #[inline]
+    fn any_in_list(&self, keys: &[Pubkey]) -> bool {
+        keys.iter().any(|key| self.contains(key))
+    }
+
+    #[inline]
+    fn contains(&self, key: &Pubkey) -> bool {
+        self.static_keys.contains(key)
+            || self.loaded_writable.contains(key)
+            || self.loaded_readonly.contains(key)
+    }
+
+    fn to_hash_set(&self) -> FoldHashSet<Pubkey> {
+        let mut account_keys = FoldHashSet::with_capacity(
+            self.static_keys.len() + self.loaded_writable.len() + self.loaded_readonly.len(),
+        );
+        account_keys.extend(self.static_keys.iter().copied());
+        account_keys.extend(self.loaded_writable.iter().copied());
+        account_keys.extend(self.loaded_readonly.iter().copied());
+        account_keys
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct TransactionFilterGate {
+    inner: Arc<TransactionFilterGateInner>,
+}
+
+#[derive(Debug)]
+struct TransactionFilterGateInner {
+    by_client: StdMutex<HashMap<usize, Vec<TransactionFilterRule>>>,
+    merged: ArcSwap<Vec<TransactionFilterRule>>,
+}
+
+impl Default for TransactionFilterGateInner {
+    fn default() -> Self {
+        Self {
+            by_client: StdMutex::new(HashMap::new()),
+            merged: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+}
+
+impl TransactionFilterGate {
+    pub fn update_client(&self, client_id: usize, filter: &Filter) {
+        let rules = filter.transaction_filter_rules();
+        let mut by_client = self
+            .inner
+            .by_client
+            .lock()
+            .expect("transaction filter gate mutex poisoned");
+        if rules.is_empty() {
+            by_client.remove(&client_id);
+        } else {
+            by_client.insert(client_id, rules);
+        }
+        self.rebuild_locked(&by_client);
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let mut by_client = self
+            .inner
+            .by_client
+            .lock()
+            .expect("transaction filter gate mutex poisoned");
+        by_client.remove(&client_id);
+        self.rebuild_locked(&by_client);
+    }
+
+    fn rebuild_locked(&self, by_client: &HashMap<usize, Vec<TransactionFilterRule>>) {
+        let total_rules = by_client.values().map(Vec::len).sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in by_client.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        self.inner.merged.store(Arc::new(merged));
+    }
+
+    fn allows_prepared(
+        &self,
+        is_vote: bool,
+        is_failed: bool,
+        signature: &Signature,
+        account_keys: &TxAccountKeysView<'_>,
+    ) -> bool {
+        let rules = self.inner.merged.load();
+        if rules.is_empty() {
+            return false;
+        }
+
+        rules
+            .iter()
+            .any(|rule| rule.matches(is_vote, is_failed, signature, account_keys))
+    }
+
+    pub fn allows_and_account_keys(
+        &self,
+        tx_info: &ReplicaTransactionInfoV3<'_>,
+    ) -> Option<FoldHashSet<Pubkey>> {
+        let account_keys = TxAccountKeysView::new(tx_info);
+        if self.allows_prepared(
+            tx_info.is_vote,
+            tx_info.transaction_status_meta.status.is_err(),
+            tx_info.signature,
+            &account_keys,
+        ) {
+            Some(account_keys.to_hash_set())
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeshredTransactionFilterRule {
+    vote: Option<bool>,
+    account_include: FoldHashSet<Pubkey>,
+    account_exclude: FoldHashSet<Pubkey>,
+    account_required: FoldHashSet<Pubkey>,
+}
+
+impl DeshredTransactionFilterRule {
+    fn matches(&self, is_vote: bool, account_keys: &DeshredAccountKeysView<'_>) -> bool {
+        if let Some(expected_vote) = self.vote {
+            if expected_vote != is_vote {
+                return false;
+            }
+        }
+
+        if !self.account_include.is_empty() && !account_keys.any_in_set(&self.account_include) {
+            return false;
+        }
+
+        if !self.account_exclude.is_empty() && account_keys.any_in_set(&self.account_exclude) {
+            return false;
+        }
+
+        if !self.account_required.is_empty()
+            && !self
+                .account_required
+                .iter()
+                .all(|required| account_keys.contains(required))
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeshredStaticAccountKeysView<'a> {
+    Slice(&'a [Pubkey]),
+    Set(&'a FoldHashSet<Pubkey>),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DeshredAccountKeysView<'a> {
+    static_keys: DeshredStaticAccountKeysView<'a>,
+    loaded_writable: &'a [Pubkey],
+    loaded_readonly: &'a [Pubkey],
+}
+
+impl<'a> DeshredAccountKeysView<'a> {
+    fn from_geyser(info: &'a ReplicaDeshredTransactionInfo<'_>) -> Self {
+        let empty: &'a [Pubkey] = &[];
+        let (loaded_writable, loaded_readonly) = info
+            .loaded_addresses
+            .map(|loaded| (loaded.writable.as_slice(), loaded.readonly.as_slice()))
+            .unwrap_or((empty, empty));
+
+        Self {
+            static_keys: DeshredStaticAccountKeysView::Slice(
+                info.transaction.message.static_account_keys(),
+            ),
+            loaded_writable,
+            loaded_readonly,
+        }
+    }
+
+    fn from_geyser_v2(info: &'a ReplicaDeshredTransactionInfoV2<'_>) -> Self {
+        let empty: &'a [Pubkey] = &[];
+        let (loaded_writable, loaded_readonly) = info
+            .loaded_addresses
+            .map(|loaded| (loaded.writable.as_slice(), loaded.readonly.as_slice()))
+            .unwrap_or((empty, empty));
+
+        Self {
+            static_keys: DeshredStaticAccountKeysView::Slice(
+                info.transaction.message.static_account_keys(),
+            ),
+            loaded_writable,
+            loaded_readonly,
+        }
+    }
+
+    fn from_message_info(info: &'a MessageDeshredTransactionInfo) -> Self {
+        Self {
+            static_keys: DeshredStaticAccountKeysView::Set(&info.static_account_keys),
+            loaded_writable: &info.loaded_writable_addresses,
+            loaded_readonly: &info.loaded_readonly_addresses,
+        }
+    }
+
+    #[inline]
+    fn any_in_set(&self, keys: &FoldHashSet<Pubkey>) -> bool {
+        keys.iter().any(|key| self.contains(key))
+    }
+
+    #[inline]
+    fn contains(&self, key: &Pubkey) -> bool {
+        (match self.static_keys {
+            DeshredStaticAccountKeysView::Slice(keys) => keys.contains(key),
+            DeshredStaticAccountKeysView::Set(keys) => keys.contains(key),
+        }) || self.loaded_writable.contains(key)
+            || self.loaded_readonly.contains(key)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct DeshredTransactionFilterGate {
+    inner: Arc<DeshredTransactionFilterGateInner>,
+}
+
+#[derive(Debug)]
+struct DeshredTransactionFilterGateInner {
+    by_client: StdMutex<HashMap<usize, Vec<DeshredTransactionFilterRule>>>,
+    merged: ArcSwap<Vec<DeshredTransactionFilterRule>>,
+}
+
+impl Default for DeshredTransactionFilterGateInner {
+    fn default() -> Self {
+        Self {
+            by_client: StdMutex::new(HashMap::new()),
+            merged: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+}
+
+impl DeshredTransactionFilterGate {
+    pub fn update_client(&self, client_id: usize, filter: &DeshredFilter) {
+        let rules = filter.deshred_transaction_filter_rules();
+        let mut by_client = self
+            .inner
+            .by_client
+            .lock()
+            .expect("deshred transaction filter gate mutex poisoned");
+        if rules.is_empty() {
+            by_client.remove(&client_id);
+        } else {
+            by_client.insert(client_id, rules);
+        }
+        self.rebuild_locked(&by_client);
+    }
+
+    pub fn remove_client(&self, client_id: usize) {
+        let mut by_client = self
+            .inner
+            .by_client
+            .lock()
+            .expect("deshred transaction filter gate mutex poisoned");
+        by_client.remove(&client_id);
+        self.rebuild_locked(&by_client);
+    }
+
+    fn rebuild_locked(&self, by_client: &HashMap<usize, Vec<DeshredTransactionFilterRule>>) {
+        let total_rules = by_client.values().map(Vec::len).sum::<usize>();
+        let mut merged = Vec::with_capacity(total_rules);
+        for rules in by_client.values() {
+            merged.extend(rules.iter().cloned());
+        }
+        self.inner.merged.store(Arc::new(merged));
+    }
+
+    fn allows_prepared(&self, is_vote: bool, account_keys: &DeshredAccountKeysView<'_>) -> bool {
+        let rules = self.inner.merged.load();
+        if rules.is_empty() {
+            return false;
+        }
+
+        rules.iter().any(|rule| rule.matches(is_vote, account_keys))
+    }
+
+    pub fn allows_message(&self, message: &MessageDeshredTransaction) -> bool {
+        let account_keys = DeshredAccountKeysView::from_message_info(&message.transaction);
+        self.allows_prepared(message.transaction.is_vote, &account_keys)
+    }
+
+    pub fn allows_geyser(&self, transaction: &ReplicaDeshredTransactionInfoVersions<'_>) -> bool {
+        match transaction {
+            ReplicaDeshredTransactionInfoVersions::V0_0_1(info) => {
+                let account_keys = DeshredAccountKeysView::from_geyser(info);
+                self.allows_prepared(info.is_vote, &account_keys)
+            }
+            ReplicaDeshredTransactionInfoVersions::V0_0_2(info) => {
+                let account_keys = DeshredAccountKeysView::from_geyser_v2(info);
+                self.allows_prepared(info.is_vote, &account_keys)
+            }
+        }
+    }
 }
 
 // Collective representation of all the required conditions of a single account filter. This is used to determine if a filter should be included in the filtered updates.
@@ -440,6 +932,39 @@ impl FilterAccounts {
             FilteredUpdateOneof::account(message, accounts_data_slice.clone()),
             message.created_at
         )
+    }
+
+    fn filter_rules(&self) -> Vec<AccountFilterRule> {
+        self.aggregates
+            .iter()
+            .map(|aggregate| {
+                let name = &aggregate.filter_name;
+                let account = self
+                    .account
+                    .iter()
+                    .filter_map(|(pubkey, names)| names.contains(name).then_some(*pubkey))
+                    .collect();
+                let owner = self
+                    .owner
+                    .iter()
+                    .filter_map(|(pubkey, names)| names.contains(name).then_some(*pubkey))
+                    .collect();
+                let nonempty_txn_signature = self
+                    .nonempty_txn_signature
+                    .iter()
+                    .find_map(|(filter_name, value)| (filter_name == name).then_some(*value))
+                    .flatten();
+
+                AccountFilterRule {
+                    nonempty_txn_signature,
+                    account,
+                    account_required: aggregate.require_account,
+                    account_cuckoo: self.account_cuckoo.get(name).cloned(),
+                    owner,
+                    owner_required: aggregate.require_owner,
+                }
+            })
+            .collect()
     }
 }
 
@@ -939,6 +1464,20 @@ impl FilterTransactions {
             message.created_at
         )
     }
+
+    fn filter_rules(&self) -> Vec<TransactionFilterRule> {
+        self.filters
+            .iter()
+            .map(|(_name, inner)| TransactionFilterRule {
+                vote: inner.vote,
+                failed: inner.failed,
+                signature: inner.signature,
+                account_include: inner.account_include.clone(),
+                account_exclude: inner.account_exclude.clone(),
+                account_required: inner.account_required.clone(),
+            })
+            .collect()
+    }
 }
 
 /// Owners of every parseable pre OR post token balance on the tx.
@@ -1100,33 +1639,27 @@ impl FilterDeshredTransactions {
                     }
                 }
 
-                let tx = &message.transaction;
+                let account_keys = DeshredAccountKeysView::from_message_info(&message.transaction);
 
                 if !inner.account_include.is_empty()
-                    && !tx
-                        .all_account_keys()
-                        .any(|key| inner.account_include.contains(key))
+                    && !account_keys.any_in_set(&inner.account_include)
                 {
                     return None;
                 }
 
                 if !inner.account_exclude.is_empty()
-                    && tx
-                        .all_account_keys()
-                        .any(|key| inner.account_exclude.contains(key))
+                    && account_keys.any_in_set(&inner.account_exclude)
                 {
                     return None;
                 }
 
-                if !inner.account_required.is_empty() {
-                    let all_keys: HashSet<&Pubkey> = tx.all_account_keys().collect();
-                    if !inner
+                if !inner.account_required.is_empty()
+                    && !inner
                         .account_required
                         .iter()
-                        .all(|key| all_keys.contains(key))
-                    {
-                        return None;
-                    }
+                        .all(|required| account_keys.contains(required))
+                {
+                    return None;
                 }
 
                 Some(name.clone())
@@ -1142,6 +1675,18 @@ impl FilterDeshredTransactions {
             ));
         }
         messages
+    }
+
+    fn filter_rules(&self) -> Vec<DeshredTransactionFilterRule> {
+        self.filters
+            .values()
+            .map(|inner| DeshredTransactionFilterRule {
+                vote: inner.vote,
+                account_include: inner.account_include.clone(),
+                account_exclude: inner.account_exclude.clone(),
+                account_required: inner.account_required.clone(),
+            })
+            .collect()
     }
 }
 
@@ -1223,6 +1768,10 @@ impl DeshredFilter {
 
     pub fn get_pong_msg(&self) -> Option<FilteredUpdateDeshred> {
         self.ping.map(FilteredUpdateDeshred::pong)
+    }
+
+    fn deshred_transaction_filter_rules(&self) -> Vec<DeshredTransactionFilterRule> {
+        self.deshred_transactions.filter_rules()
     }
 
     pub fn get_metrics(&self) -> [(&'static str, usize); 3] {
@@ -1584,7 +2133,10 @@ impl FilterAccountsDataSlice {
 #[cfg(test)]
 mod tests {
     use {
-        super::{DeshredFilter, Filter},
+        super::{
+            AccountFilterGate, DeshredFilter, DeshredTransactionFilterGate, Filter,
+            TransactionFilterGate, TxAccountKeysView,
+        },
         crate::plugin::{
             convert_to,
             filter::{
@@ -1602,6 +2154,7 @@ mod tests {
         solana_keypair::Keypair,
         solana_message::{v0::LoadedAddresses, Message as SolMessage, MessageHeader},
         solana_pubkey::Pubkey,
+        solana_signature::Signature,
         solana_signer::Signer,
         solana_transaction::{versioned::VersionedTransaction, Transaction},
         solana_transaction_status::TransactionStatusMeta,
@@ -1697,6 +2250,175 @@ mod tests {
         let limit = FilterLimits::default();
         let filter = Filter::new(&config, &limit, &mut create_filter_names());
         assert!(filter.is_ok());
+    }
+
+    #[test]
+    fn account_filter_gate_matches_filter_snapshot() {
+        let watched = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            "account".to_owned(),
+            SubscribeRequestFilterAccounts {
+                nonempty_txn_signature: None,
+                account: vec![watched.to_string()],
+                owner: vec![],
+                filters: vec![],
+                cuckoo_accounts_filter: None,
+            },
+        );
+        let config = SubscribeRequest {
+            accounts,
+            slots: HashMap::new(),
+            transactions: HashMap::new(),
+            transactions_status: HashMap::new(),
+            blocks: HashMap::new(),
+            blocks_meta: HashMap::new(),
+            entry: HashMap::new(),
+            commitment: None,
+            accounts_data_slice: Vec::new(),
+            ping: None,
+            from_slot: None,
+        };
+        let filter = Filter::new(
+            &config,
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .expect("filter should build");
+        let gate = AccountFilterGate::default();
+        gate.update_client(1, &filter);
+
+        assert!(gate.allows(&watched, &owner, false));
+        assert!(!gate.allows(&Pubkey::new_unique(), &owner, false));
+
+        gate.remove_client(1);
+        assert!(!gate.allows(&Pubkey::new_unique(), &owner, false));
+    }
+
+    #[test]
+    fn transaction_filter_gate_matches_filter_snapshot() {
+        let watched = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "tx".to_owned(),
+            SubscribeRequestFilterTransactions {
+                vote: None,
+                failed: None,
+                signature: None,
+                account_include: vec![watched.to_string()],
+                account_exclude: vec![],
+                account_required: vec![],
+                token_accounts: None,
+            },
+        );
+        let config = SubscribeRequest {
+            accounts: HashMap::new(),
+            slots: HashMap::new(),
+            transactions,
+            transactions_status: HashMap::new(),
+            blocks: HashMap::new(),
+            blocks_meta: HashMap::new(),
+            entry: HashMap::new(),
+            commitment: None,
+            accounts_data_slice: Vec::new(),
+            ping: None,
+            from_slot: None,
+        };
+        let filter = Filter::new(
+            &config,
+            &FilterLimits::default(),
+            &mut create_filter_names(),
+        )
+        .expect("filter should build");
+        let signature = Signature::default();
+        let gate = TransactionFilterGate::default();
+        gate.update_client(2, &filter);
+        let empty_keys: &[Pubkey] = &[];
+        let watched_keys = [watched];
+        let watched_view = TxAccountKeysView {
+            static_keys: &watched_keys,
+            loaded_writable: empty_keys,
+            loaded_readonly: empty_keys,
+        };
+        let other_keys = [other];
+        let other_view = TxAccountKeysView {
+            static_keys: &other_keys,
+            loaded_writable: empty_keys,
+            loaded_readonly: empty_keys,
+        };
+
+        assert!(gate.allows_prepared(false, false, &signature, &watched_view));
+        assert!(!gate.allows_prepared(false, false, &signature, &other_view));
+
+        gate.remove_client(2);
+        assert!(!gate.allows_prepared(false, false, &signature, &other_view));
+    }
+
+    #[test]
+    fn deshred_transaction_filter_gate_matches_filter_snapshot() {
+        let keypair = Keypair::new();
+        let key_a = keypair.pubkey();
+        let key_b = Pubkey::new_unique();
+        let key_c = Pubkey::new_unique();
+        let key_d = Pubkey::new_unique();
+
+        let mut deshred_transactions = HashMap::new();
+        deshred_transactions.insert(
+            "deshred".to_string(),
+            SubscribeRequestFilterDeshredTransactions {
+                vote: Some(true),
+                account_include: vec![key_b.to_string()],
+                account_exclude: vec![key_d.to_string()],
+                account_required: vec![key_c.to_string()],
+            },
+        );
+        let config = SubscribeDeshredRequest {
+            deshred_transactions,
+            ping: None,
+            slots: HashMap::new(),
+        };
+        let limit = FilterLimits::default();
+        let filter = DeshredFilter::new(&config, &limit, &mut create_filter_names()).unwrap();
+        let gate = DeshredTransactionFilterGate::default();
+
+        let matching = create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_b],
+            vec![key_c],
+            vec![],
+            true,
+        );
+        assert!(!gate.allows_message(&matching));
+
+        gate.update_client(1, &filter);
+        assert!(gate.allows_message(&matching));
+
+        let wrong_vote = create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_b],
+            vec![key_c],
+            vec![],
+            false,
+        );
+        assert!(!gate.allows_message(&wrong_vote));
+
+        let missing_required =
+            create_message_deshred_transaction(&keypair, vec![key_a, key_b], vec![], vec![], true);
+        assert!(!gate.allows_message(&missing_required));
+
+        let excluded = create_message_deshred_transaction(
+            &keypair,
+            vec![key_a, key_b, key_d],
+            vec![key_c],
+            vec![],
+            true,
+        );
+        assert!(!gate.allows_message(&excluded));
+
+        gate.remove_client(1);
+        assert!(!gate.allows_message(&matching));
     }
 
     #[test]

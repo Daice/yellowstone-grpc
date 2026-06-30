@@ -4,7 +4,10 @@ use {
         grpc::GrpcService,
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
         plugin::{
-            filter::limits::FilterLimits,
+            filter::{
+                limits::FilterLimits, AccountFilterGate, DeshredTransactionFilterGate,
+                TransactionFilterGate,
+            },
             message::{
                 Message, MessageAccount, MessageBlockMeta, MessageDeshredTransaction, MessageEntry,
                 MessageSlot, MessageTransaction,
@@ -38,9 +41,15 @@ pub struct PluginInner {
     runtime: Runtime,
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
+    #[allow(dead_code)]
     filter_limits: FilterLimits,
     grpc_channel: mpsc::UnboundedSender<Message>,
     deshred_channel: broadcast::Sender<Message>,
+    strip_transaction_log_messages: bool,
+    early_filter_enabled: bool,
+    account_filter_gate: AccountFilterGate,
+    transaction_filter_gate: TransactionFilterGate,
+    deshred_transaction_filter_gate: DeshredTransactionFilterGate,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
 }
@@ -56,6 +65,10 @@ impl PluginInner {
         if let Ok(count) = self.deshred_channel.send(message) {
             metrics::deshred_queue_size_inc(count as i64);
         }
+    }
+
+    fn can_apply_early_filter(&self) -> bool {
+        self.early_filter_enabled
     }
 }
 
@@ -88,6 +101,11 @@ impl GeyserPlugin for Plugin {
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
+        let strip_transaction_log_messages = config.grpc.strip_transaction_log_messages;
+        let early_filter_enabled = config.grpc.replay_stored_slots == 0;
+        let account_filter_gate = AccountFilterGate::default();
+        let transaction_filter_gate = TransactionFilterGate::default();
+        let deshred_transaction_filter_gate = DeshredTransactionFilterGate::default();
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
@@ -114,6 +132,9 @@ impl GeyserPlugin for Plugin {
         let prometheus_task_tracker = plugin_task_tracker.clone();
         let grpc_cancellation_token = plugin_cancellation_token.child_token();
         let grpc_task_tracker = plugin_task_tracker.clone();
+        let grpc_account_filter_gate = account_filter_gate.clone();
+        let grpc_transaction_filter_gate = transaction_filter_gate.clone();
+        let grpc_deshred_transaction_filter_gate = deshred_transaction_filter_gate.clone();
 
         let runtime = builder
             .thread_name_fn(crate::get_thread_name)
@@ -145,6 +166,9 @@ impl GeyserPlugin for Plugin {
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
+                grpc_account_filter_gate,
+                grpc_transaction_filter_gate,
+                grpc_deshred_transaction_filter_gate,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
@@ -168,6 +192,11 @@ impl GeyserPlugin for Plugin {
             filter_limits,
             grpc_channel,
             deshred_channel,
+            strip_transaction_log_messages,
+            early_filter_enabled,
+            account_filter_gate,
+            transaction_filter_gate,
+            deshred_transaction_filter_gate,
             plugin_cancellation_token,
             plugin_task_tracker,
         });
@@ -211,9 +240,14 @@ impl GeyserPlugin for Plugin {
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
 
-            if let Ok(owner) = Pubkey::try_from(account.owner) {
-                // Drop accounts from owners in the drop list, even during startup.
-                if inner.filter_limits.accounts.owner_reject.contains(&owner) {
+            let pubkey = Pubkey::try_from(account.pubkey).expect("valid Pubkey");
+            let owner = Pubkey::try_from(account.owner).expect("valid Pubkey");
+
+            if !is_startup && inner.can_apply_early_filter() {
+                if !inner
+                    .account_filter_gate
+                    .allows(&pubkey, &owner, account.txn.is_some())
+                {
                     incr_geyser_event_dropped("account");
                     return Ok(());
                 }
@@ -221,8 +255,9 @@ impl GeyserPlugin for Plugin {
 
             if is_startup {
                 if let Some(channel) = inner.snapshot_channel.lock().unwrap().as_ref() {
-                    let message =
-                        Message::Account(MessageAccount::from_geyser(account, slot, is_startup));
+                    let message = Message::Account(MessageAccount::from_geyser_with_keys(
+                        account, slot, is_startup, pubkey, owner,
+                    ));
                     match channel.send(Box::new(message)) {
                         Ok(()) => metrics::message_queue_size_inc(),
                         Err(_) => {
@@ -235,8 +270,9 @@ impl GeyserPlugin for Plugin {
                     }
                 }
             } else {
-                let message =
-                    Message::Account(MessageAccount::from_geyser(account, slot, is_startup));
+                let message = Message::Account(MessageAccount::from_geyser_with_keys(
+                    account, slot, is_startup, pubkey, owner,
+                ));
                 inner.send_message(message);
             }
 
@@ -282,7 +318,31 @@ impl GeyserPlugin for Plugin {
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
             };
 
-            let message = Message::Transaction(MessageTransaction::from_geyser(transaction, slot));
+            if inner.can_apply_early_filter() {
+                let Some(account_keys) = inner
+                    .transaction_filter_gate
+                    .allows_and_account_keys(transaction)
+                else {
+                    incr_geyser_event_dropped("transaction");
+                    return Ok(());
+                };
+
+                let message =
+                    Message::Transaction(MessageTransaction::from_geyser_with_account_keys_config(
+                        transaction,
+                        slot,
+                        account_keys,
+                        inner.strip_transaction_log_messages,
+                    ));
+                inner.send_message(message);
+                return Ok(());
+            }
+
+            let message = Message::Transaction(MessageTransaction::from_geyser_with_config(
+                transaction,
+                slot,
+                inner.strip_transaction_log_messages,
+            ));
             inner.send_message(message);
 
             Ok(())
@@ -334,6 +394,15 @@ impl GeyserPlugin for Plugin {
         slot: u64,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            if inner.can_apply_early_filter()
+                && !inner
+                    .deshred_transaction_filter_gate
+                    .allows_geyser(&transaction)
+            {
+                incr_geyser_event_dropped("deshred_transaction");
+                return Ok(());
+            }
+
             let message = Message::DeshredTransaction(
                 MessageDeshredTransaction::from_geyser_versioned(transaction, slot),
             );
