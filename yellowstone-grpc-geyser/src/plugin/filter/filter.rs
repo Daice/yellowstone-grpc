@@ -47,6 +47,10 @@ use {
     },
 };
 
+#[path = "fast_path.rs"]
+mod fast_path;
+pub use fast_path::FastPathFilterGates;
+
 #[derive(Debug, Clone)]
 struct HybridSet<T> {
     vec: Vec<T>,

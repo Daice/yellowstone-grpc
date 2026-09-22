@@ -194,12 +194,24 @@ pub struct MessageAccountInfo {
 
 impl MessageAccountInfo {
     pub fn from_geyser(info: &ReplicaAccountInfoV3<'_>) -> Self {
+        Self::from_geyser_with_keys(
+            info,
+            Pubkey::try_from(info.pubkey).expect("valid Pubkey"),
+            Pubkey::try_from(info.owner).expect("valid Pubkey"),
+        )
+    }
+
+    fn from_geyser_with_keys(
+        info: &ReplicaAccountInfoV3<'_>,
+        pubkey: Pubkey,
+        owner: Pubkey,
+    ) -> Self {
         let shared = info.data.to_vec();
         let data = Bytes::from(shared);
         Self {
-            pubkey: Pubkey::try_from(info.pubkey).expect("valid Pubkey"),
+            pubkey,
             lamports: info.lamports,
-            owner: Pubkey::try_from(info.owner).expect("valid Pubkey"),
+            owner,
             executable: info.executable,
             rent_epoch: info.rent_epoch,
             data,
@@ -225,6 +237,22 @@ pub struct MessageAccount {
 }
 
 impl MessageAccount {
+    pub fn from_geyser_for_bank(
+        info: &ReplicaAccountInfoV3<'_>,
+        slot: Slot,
+        bank_id: BankId,
+        pubkey: Pubkey,
+        owner: Pubkey,
+    ) -> Self {
+        Self {
+            account: MessageAccountInfo::from_geyser_with_keys(info, pubkey, owner),
+            slot,
+            is_startup: false,
+            bank_id: Some(bank_id),
+            created_at: Timestamp::from(SystemTime::now()),
+        }
+    }
+
     pub fn from_geyser(
         info: &ReplicaAccountInfoV3<'_>,
         slot: Slot,
@@ -287,6 +315,13 @@ impl MessageTransactionInfo {
             .copied()
             .collect();
 
+        Self::from_geyser_with_account_keys(info, account_keys)
+    }
+
+    fn from_geyser_with_account_keys(
+        info: &ReplicaTransactionInfoV3<'_>,
+        account_keys: FoldHashSet<Pubkey>,
+    ) -> Self {
         Self {
             signature: *info.signature,
             is_vote: info.is_vote,
@@ -346,6 +381,20 @@ pub struct MessageTransaction {
 }
 
 impl MessageTransaction {
+    pub fn from_geyser_with_account_keys(
+        info: &ReplicaTransactionInfoV3<'_>,
+        slot: Slot,
+        bank_id: BankId,
+        account_keys: FoldHashSet<Pubkey>,
+    ) -> Self {
+        Self {
+            transaction: MessageTransactionInfo::from_geyser_with_account_keys(info, account_keys),
+            slot,
+            created_at: Timestamp::from(SystemTime::now()),
+            bank_id,
+        }
+    }
+
     pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>, slot: Slot, bank_id: BankId) -> Self {
         Self {
             transaction: MessageTransactionInfo::from_geyser(info),

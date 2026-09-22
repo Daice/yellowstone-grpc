@@ -8,5 +8,6 @@ pub mod message;
 pub mod name;
 
 pub use filter::{
-    DeshredFilter, Filter, FilterAccountsDataSlice, FilterError, FilterResult, FilterStats,
+    DeshredFilter, FastPathFilterGates, Filter, FilterAccountsDataSlice, FilterError, FilterResult,
+    FilterStats,
 };

@@ -19,7 +19,7 @@ use {
                 limits::FilterLimits,
                 message::{FilteredUpdate, FilteredUpdateDeshred, FilteredUpdateOneof},
                 name::FilterNames,
-                DeshredFilter, Filter,
+                DeshredFilter, FastPathFilterGates, Filter,
             },
             message::{CommitmentLevel, Message, MessageBlockMeta, MessageSlot, SlotStatus},
             proto::geyser_server::{Geyser, GeyserServer},
@@ -522,6 +522,7 @@ struct ClientSession {
     subscriber_id: String,
     endpoint: String,
     filter: Filter,
+    fast_path_gates: Option<FastPathFilterGates>,
     cancellation_token: CancellationToken,
     disconnect_reason: &'static str,
     /// Must own it so that when the session is dropped, the subscription count is decremented.
@@ -545,6 +546,7 @@ impl ClientSession {
             subscriber_id,
             endpoint,
             filter,
+            fast_path_gates: None,
             cancellation_token,
             disconnect_reason: "unknown",
             _subscription_permit: subscription_permit,
@@ -552,6 +554,9 @@ impl ClientSession {
     }
 
     fn set_filter(&mut self, new_filter: Filter) {
+        if let Some(gates) = &self.fast_path_gates {
+            gates.update_client(self.id, &new_filter);
+        }
         metrics::update_subscriptions(&self.endpoint, Some(&self.filter), Some(&new_filter));
         self.filter = new_filter;
     }
@@ -559,6 +564,9 @@ impl ClientSession {
 
 impl Drop for ClientSession {
     fn drop(&mut self) {
+        if let Some(gates) = &self.fast_path_gates {
+            gates.remove_client(self.id);
+        }
         observe_subscriber_queue_size(&self.subscriber_id, 0, "normal");
         metrics::incr_client_disconnect(&self.subscriber_id, self.disconnect_reason);
         metrics::update_subscriptions(&self.endpoint, Some(&self.filter), None);
@@ -574,6 +582,7 @@ struct DeshredClientSession {
     id: usize,
     subscriber_id: String,
     filter: DeshredFilter,
+    fast_path_gates: Option<FastPathFilterGates>,
     cancellation_token: CancellationToken,
     disconnect_reason: &'static str,
     _subscription_permit: Option<SubscriptionOwnedPermit>,
@@ -592,15 +601,26 @@ impl DeshredClientSession {
             id,
             subscriber_id,
             filter: DeshredFilter::default(),
+            fast_path_gates: None,
             cancellation_token,
             disconnect_reason: "unknown",
             _subscription_permit: subscription_permit,
         }
     }
+
+    fn set_filter(&mut self, filter: DeshredFilter) {
+        if let Some(gates) = &self.fast_path_gates {
+            gates.update_deshred_client(self.id, &filter);
+        }
+        self.filter = filter;
+    }
 }
 
 impl Drop for DeshredClientSession {
     fn drop(&mut self) {
+        if let Some(gates) = &self.fast_path_gates {
+            gates.remove_deshred_client(self.id);
+        }
         observe_subscriber_queue_size(&self.subscriber_id, 0, "deshred");
         metrics::incr_client_disconnect(&self.subscriber_id, self.disconnect_reason);
         info!(
@@ -678,6 +698,7 @@ pub struct GrpcService {
     subscribe_id: Arc<AtomicUsize>,
     snapshot_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>>,
     broadcast: SubscriberChannels,
+    fast_path_gates: Option<FastPathFilterGates>,
     deshred_broadcast_tx: broadcast::Sender<DeshredBroadcastedMessage>,
     contact_info_state: Arc<ContactInfoState>,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
@@ -827,9 +848,10 @@ fn load_server_config_from_tls_config(
 pub struct GrpcServiceResult {
     pub snapshot_tx: Option<crossbeam_channel::Sender<Box<Message>>>,
     pub deshred_broadcast_tx: broadcast::Sender<DeshredBroadcastedMessage>,
-    pub block_reconstruction_tx: mpsc::UnboundedSender<BlockReconstructionMessage>,
+    pub block_reconstruction_tx: Option<mpsc::UnboundedSender<BlockReconstructionMessage>>,
     pub contact_info_tx: mpsc::UnboundedSender<contact_info::ContactInfoNotification>,
     pub broadcast: SubscriberChannels,
+    pub fast_path_gates: Option<FastPathFilterGates>,
     pub blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
 }
 
@@ -1061,6 +1083,8 @@ impl GrpcService {
         let initial_connection_window_size = config.server_initial_connection_window_size;
         let initial_stream_window_size = config.server_initial_stream_window_size;
 
+        let fast_path_gates = (config.replay_stored_slots == 0).then(FastPathFilterGates::default);
+
         // Build the shared GeyserServer (Clone-able because GrpcService: Clone)
         let max_decoding_message_size = config.max_decoding_message_size;
         let mut service = GeyserServer::new(Self {
@@ -1075,6 +1099,7 @@ impl GrpcService {
             subscribe_id: Arc::new(AtomicUsize::new(0)),
             snapshot_rx: Arc::new(Mutex::new(snapshot_rx)),
             broadcast: broadcast.clone(),
+            fast_path_gates: fast_path_gates.clone(),
             deshred_broadcast_tx: deshred_broadcast_tx.clone(),
             contact_info_state: Arc::clone(&contact_info_state),
             replay_stored_slots_tx,
@@ -1093,39 +1118,33 @@ impl GrpcService {
             service = service.send_compressed(encoding);
         }
 
-        let (block_reconstruction_tx, block_reconstruction_rx) = mpsc::unbounded_channel();
-
-        // Warn if replay buffer is too small for auto-reconnect
-        if config.replay_stored_slots < 150 {
+        // Warn only when replay is enabled.
+        if config.replay_stored_slots > 0 && config.replay_stored_slots < 150 {
             log::warn!(
                 "replay_stored_slots={} may be too low for auto-reconnect; recommend >= 150",
                 config.replay_stored_slots
             );
         }
 
-        {
-            let broadcast = broadcast.clone();
-
-            task_tracker.spawn(async move {
-                Self::block_reconstruction_loop(
-                    BatchStreamUnboundedReceiver::new(block_reconstruction_rx),
-                    broadcast,
-                    replay_stored_slots_rx,
-                    replay_first_available_slot,
-                    config.replay_stored_slots,
-                )
-                .await;
-            });
-        }
-
-        {
-            let block_reconstruction_tx = block_reconstruction_tx.clone();
-            let broadcast = broadcast.clone();
-
-            task_tracker.spawn(async move {
-                Self::geyser_loop(messages_rx, broadcast, block_reconstruction_tx).await;
-            });
-        }
+        let block_reconstruction_tx = if config.replay_stored_slots == 0 {
+            task_tracker.spawn(Self::geyser_processed_loop(messages_rx, broadcast.clone()));
+            None
+        } else {
+            let (tx, rx) = mpsc::unbounded_channel();
+            task_tracker.spawn(Self::block_reconstruction_loop(
+                BatchStreamUnboundedReceiver::new(rx),
+                broadcast.clone(),
+                replay_stored_slots_rx,
+                replay_first_available_slot,
+                config.replay_stored_slots,
+            ));
+            task_tracker.spawn(Self::geyser_loop(
+                messages_rx,
+                broadcast.clone(),
+                tx.clone(),
+            ));
+            Some(tx)
+        };
 
         // Health check service
         let (health_reporter, health_service) = health_reporter();
@@ -1204,8 +1223,30 @@ impl GrpcService {
             contact_info_tx,
             block_reconstruction_tx,
             broadcast,
+            fast_path_gates,
             blocks_meta_tx,
         })
+    }
+
+    /// Processed-only routing: drain available messages without waiting to fill a batch.
+    /// Payload encoding remains lazy in the client stream, using the shared message caches.
+    async fn geyser_processed_loop<St>(mut messages_rx: St, broadcast: SubscriberChannels)
+    where
+        St: BatchStream<Item = Message> + Unpin + Send + 'static,
+    {
+        const MESSAGE_BATCH_SIZE: usize = 4;
+        let mut messages = Vec::with_capacity(MESSAGE_BATCH_SIZE);
+        while let Some(count) = messages_rx.next_batch(&mut messages).await {
+            metrics::message_queue_size_dec_by(count as i64);
+            for message in &messages {
+                if let Message::Slot(slot) = message {
+                    metrics::update_slot_plugin_status(slot.status, slot.slot);
+                }
+            }
+            let batch = std::mem::replace(&mut messages, Vec::with_capacity(MESSAGE_BATCH_SIZE));
+            broadcast.send(CommitmentLevel::Processed, Arc::new(batch));
+        }
+        info!("Geyser processed loop: messages channel closed");
     }
 
     /// Core message routing loop that reconstructs Solana blocks from raw Geyser plugin events
@@ -1263,11 +1304,8 @@ impl GrpcService {
     ///
     /// # Batching and metrics
     ///
-    /// Up to `PROCESSED_MESSAGES_MAX` messages are drained from `messages_rx` per iteration
-    /// to amortise channel overhead. Before each Processed broadcast, `encode_messages` pre-encodes
-    /// Account and Transaction payloads (stored in a `OnceLock` on the shared `Arc`) so that
-    /// per-client serialisation is avoided. `GEYSER_BATCH_SIZE` is observed for each Processed
-    /// broadcast.
+    /// Up to 1024 available messages are drained per batch, stopping at block metadata.
+    /// Encoding is deferred to client streams and uses shared payload caches.
     ///
     /// # Side channels
     ///
@@ -1284,7 +1322,6 @@ impl GrpcService {
         St: BatchStream<Item = Message> + Unpin + Send + 'static,
     {
         const MESSAGE_BATCH_SIZE: usize = 1024;
-        // let mut message_batch = Vec::with_capacity(MESSAGE_BATCH_SIZE);
         struct PartitionedBuffer {
             message_batch: Vec<Message>,
             blockmeta_batch: Option<Message>,
@@ -1728,8 +1765,7 @@ impl GrpcService {
                                 continue;
                             }
 
-                            metrics::update_subscriptions(&session.endpoint, Some(&session.filter), Some(&filter_new));
-                            session.filter = filter_new;
+                            session.set_filter(filter_new);
                             info!("client #{}: filter updated", session.subscriber_id);
                             break;
                         }
@@ -1986,7 +2022,7 @@ impl GrpcService {
 
                     match message {
                         Some(Some(filter_new)) => {
-                            session.filter = filter_new;
+                            session.set_filter(filter_new);
                             info!("deshred client #{}/{}: filter updated", session.subscriber_id, session.id);
                         }
                         Some(None) => {
@@ -2214,13 +2250,14 @@ impl Geyser for GrpcService {
             }
         });
 
-        let client_session = ClientSession::new(
+        let mut client_session = ClientSession::new(
             id,
             subscriber_id.clone(),
             endpoint.clone(),
             client_cancellation_token,
             subscription_permit,
         );
+        client_session.fast_path_gates = self.fast_path_gates.clone();
         self.task_tracker.spawn(Self::client_loop(
             client_session,
             stream_tx,
@@ -2367,12 +2404,13 @@ impl Geyser for GrpcService {
             }
         });
 
-        let session = DeshredClientSession::new(
+        let mut session = DeshredClientSession::new(
             id,
             subscriber_id.clone(),
             client_cancellation_token.clone(),
             subscription_permit,
         );
+        session.fast_path_gates = self.fast_path_gates.clone();
         self.task_tracker.spawn(Self::deshred_client_loop(
             session,
             stream_tx,
@@ -3018,3 +3056,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "grpc_fast_path_tests.rs"]
+mod fast_path_tests;

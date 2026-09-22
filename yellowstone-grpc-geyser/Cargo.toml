@@ -105,6 +105,11 @@ name = "filter"
 harness = false
 required-features = ["bench"]
 
+[[bench]]
+name = "fast_path"
+harness = false
+required-features = ["bench"]
+
 [build-dependencies]
 anyhow = { workspace = true }
 cargo-lock = { workspace = true }

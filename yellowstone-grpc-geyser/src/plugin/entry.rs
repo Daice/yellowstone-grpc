@@ -6,7 +6,7 @@ use {
         grpc::{BlockReconstructionMessage, GrpcService, SubscriberChannels},
         metrics::{self, incr_geyser_event_dropped, PrometheusService},
         plugin::{
-            filter::limits::FilterLimits,
+            filter::{limits::FilterLimits, FastPathFilterGates},
             message::{
                 CommitmentLevel, ContactInfoMessage, Message, MessageAccount, MessageBlockFooter,
                 MessageBlockMeta, MessageContactInfo, MessageContactInfoRemoved,
@@ -46,11 +46,12 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     filter_limits: FilterLimits,
+    fast_path_gates: Option<FastPathFilterGates>,
     grpc_channel: mpsc::UnboundedSender<Message>, // geyser_loop
     deshred_channel: broadcast::Sender<Message>,  // deshred_client_loop
     contact_info_channel: mpsc::UnboundedSender<ContactInfoNotification>,
-    block_reconstruction_channel: mpsc::UnboundedSender<BlockReconstructionMessage>, // block_reconstruction_loop
-    broadcast_channel: SubscriberChannels,                                           // client_loop
+    block_reconstruction_channel: Option<mpsc::UnboundedSender<BlockReconstructionMessage>>, // block_reconstruction_loop
+    broadcast_channel: SubscriberChannels, // client_loop
     blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
@@ -72,10 +73,14 @@ impl PluginInner {
         }
     }
 
-    // Sends messages to the block reconstruction loop
-    fn send_block_reconstruction_message(&self, message: BlockReconstructionMessage) {
-        if self.block_reconstruction_channel.send(message).is_ok() {
-            metrics::block_reconstruction_queue_size_inc();
+    // The full path reconstructs bank statuses; the fast path forwards the original event.
+    fn send_bank_status(&self, message: Message) {
+        if let Some(tx) = &self.block_reconstruction_channel {
+            if tx.send(BlockReconstructionMessage::Single(message)).is_ok() {
+                metrics::block_reconstruction_queue_size_inc();
+            }
+        } else {
+            self.send_message(message);
         }
     }
 
@@ -212,6 +217,7 @@ impl GeyserPlugin for Plugin {
             snapshot_channel: Mutex::new(grpc_service_result.snapshot_tx),
             snapshot_channel_closed: AtomicBool::new(false),
             filter_limits,
+            fast_path_gates: grpc_service_result.fast_path_gates,
             grpc_channel: grpc_channel_tx,
             deshred_channel: grpc_service_result.deshred_broadcast_tx,
             contact_info_channel: grpc_service_result.contact_info_tx,
@@ -307,19 +313,17 @@ impl GeyserPlugin for Plugin {
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
 
-            if let Ok(owner) = Pubkey::try_from(account.owner) {
-                // Drop accounts from owners in the drop list, even during startup.
-                if inner.filter_limits.accounts.owner_reject.contains(&owner) {
-                    incr_geyser_event_dropped("account");
-                    return Ok(());
-                }
+            let owner = Pubkey::try_from(account.owner).expect("valid Pubkey");
+            let pubkey = Pubkey::try_from(account.pubkey).expect("valid Pubkey");
+            if inner
+                .fast_path_gates
+                .as_ref()
+                .is_some_and(|gates| !gates.allows_account(&pubkey, &owner, account.txn.is_some()))
+            {
+                return Ok(());
             }
-
-            let message = Message::Account(Arc::new(MessageAccount::from_geyser(
-                account,
-                slot,
-                false,
-                Some(bank_id),
+            let message = Message::Account(Arc::new(MessageAccount::from_geyser_for_bank(
+                account, slot, bank_id, pubkey, owner,
             )));
             inner.send_message(message);
             Ok(())
@@ -356,12 +360,7 @@ impl GeyserPlugin for Plugin {
 
             match status {
                 SlotStatus::Processed | SlotStatus::Confirmed | SlotStatus::Rooted => {
-                    // Processed/Confirmed/Finalized slot status updates are handled by the block reconstruction loop and are never directly exposed by the processed message loop (geyser_loop.)
-                    // If they were to be sent through geyser_loop, the block_reconstruction_loop would also send them, resulting in duplicate slot life-cycle messages.
-                    // By sending them directly to block_reconstruction_loop, we avoid this issue while ensuring block reconstruction happens as normal.
-                    inner.send_block_reconstruction_message(BlockReconstructionMessage::Single(
-                        message.clone(),
-                    ));
+                    inner.send_bank_status(message.clone());
                 }
                 variant @ (SlotStatus::FirstShredReceived
                 | SlotStatus::Dead(_)
@@ -378,9 +377,14 @@ impl GeyserPlugin for Plugin {
                     inner.send_message(message.clone());
                     // FirstShredReceived/Completed/CreatedBank/Dead slot status updates for Confirmed/Finalized commitment subscribers are not explicitly sent by the block reconstruction loop.
                     // Therefore we explicitly need to forward these updates to the subscribers for all commitment levels, the geyser_loop will take care of forwarding them to the Processed commitment level.
-                    let messages = Arc::new(vec![message.clone()]);
-                    inner.send_broadcast_message(CommitmentLevel::Confirmed, Arc::clone(&messages));
-                    inner.send_broadcast_message(CommitmentLevel::Finalized, messages);
+                    if inner.block_reconstruction_channel.is_some() {
+                        let messages = Arc::new(vec![message.clone()]);
+                        inner.send_broadcast_message(
+                            CommitmentLevel::Confirmed,
+                            Arc::clone(&messages),
+                        );
+                        inner.send_broadcast_message(CommitmentLevel::Finalized, messages);
+                    }
                 }
             }
 
@@ -411,9 +415,14 @@ impl GeyserPlugin for Plugin {
                 SlotStatus::FirstShredReceived | SlotStatus::Completed | SlotStatus::Dead(_) => {
                     // FirstShredReceived/Completed/CreatedBank/Dead slot status updates for Confirmed/Finalized commitment subscribers are not explicitly sent by the block reconstruction loop.
                     // Therefore we explicitly need to forward these updates to the subscribers for all commitment levels, the geyser_loop will take care of forwarding them to the Processed commitment level.
-                    let messages = Arc::new(vec![message.clone()]);
-                    inner.send_broadcast_message(CommitmentLevel::Confirmed, Arc::clone(&messages));
-                    inner.send_broadcast_message(CommitmentLevel::Finalized, messages);
+                    if inner.block_reconstruction_channel.is_some() {
+                        let messages = Arc::new(vec![message.clone()]);
+                        inner.send_broadcast_message(
+                            CommitmentLevel::Confirmed,
+                            Arc::clone(&messages),
+                        );
+                        inner.send_broadcast_message(CommitmentLevel::Finalized, messages);
+                    }
                 }
                 variant @ (SlotStatus::Processed
                 | SlotStatus::Confirmed
@@ -454,11 +463,20 @@ impl GeyserPlugin for Plugin {
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
             };
 
-            let message = Message::Transaction(Arc::new(MessageTransaction::from_geyser(
-                transaction,
-                slot,
-                bank_id,
-            )));
+            let transaction = if let Some(gates) = &inner.fast_path_gates {
+                let Some(account_keys) = gates.transaction_account_keys(transaction) else {
+                    return Ok(());
+                };
+                MessageTransaction::from_geyser_with_account_keys(
+                    transaction,
+                    slot,
+                    bank_id,
+                    account_keys,
+                )
+            } else {
+                MessageTransaction::from_geyser(transaction, slot, bank_id)
+            };
+            let message = Message::Transaction(Arc::new(transaction));
             inner.send_message(message);
 
             Ok(())
@@ -526,6 +544,13 @@ impl GeyserPlugin for Plugin {
         slot: u64,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            if inner
+                .fast_path_gates
+                .as_ref()
+                .is_some_and(|gates| !gates.allows_deshred(&transaction))
+            {
+                return Ok(());
+            }
             let message = Message::DeshredTransaction(Arc::new(
                 MessageDeshredTransaction::from_geyser_versioned(transaction, slot),
             ));
@@ -623,4 +648,177 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
     let plugin = Plugin::default();
     let plugin: Box<dyn GeyserPlugin> = Box::new(plugin);
     Box::into_raw(plugin)
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use {
+        super::*,
+        crate::plugin::filter::{fixtures, Filter},
+        agave_geyser_plugin_interface::geyser_plugin_interface::ReplicaAccountInfoV3,
+        std::collections::HashMap,
+        yellowstone_grpc_proto::prelude::{SubscribeRequest, SubscribeRequestFilterAccounts},
+    };
+
+    #[test]
+    fn callbacks_route_bank_statuses_once_and_keep_snapshot_owner_reject() {
+        for full_path in [false, true] {
+            let (grpc_tx, mut grpc_rx) = mpsc::unbounded_channel();
+            let (reconstruction_tx, mut reconstruction_rx) = mpsc::unbounded_channel();
+            let (deshred_tx, mut deshred_rx) = broadcast::channel(16);
+            let (contact_info_tx, _contact_info_rx) = mpsc::unbounded_channel();
+            let (blocks_meta_tx, mut blocks_meta_rx) = mpsc::unbounded_channel();
+            let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded();
+            let broadcast = SubscriberChannels::new(16, 16, 16);
+            let mut confirmed_rx = broadcast.subscribe(CommitmentLevel::Confirmed);
+            let mut finalized_rx = broadcast.subscribe(CommitmentLevel::Finalized);
+            let rejected_owner = Pubkey::new_unique();
+            let mut limits = FilterLimits::default();
+            limits.accounts.owner_reject.insert(rejected_owner);
+            let plugin = Plugin {
+                inner: Some(PluginInner {
+                    runtime: Builder::new_current_thread().enable_all().build().unwrap(),
+                    snapshot_channel: Mutex::new(Some(snapshot_tx)),
+                    snapshot_channel_closed: AtomicBool::new(false),
+                    filter_limits: limits,
+                    fast_path_gates: (!full_path).then(FastPathFilterGates::default),
+                    grpc_channel: grpc_tx,
+                    deshred_channel: deshred_tx,
+                    contact_info_channel: contact_info_tx,
+                    block_reconstruction_channel: full_path.then_some(reconstruction_tx),
+                    broadcast_channel: broadcast,
+                    blocks_meta_tx: Some(blocks_meta_tx),
+                    plugin_cancellation_token: CancellationToken::new(),
+                    plugin_task_tracker: TaskTracker::new(),
+                    file_watcher: Arc::new(FileWatcher::new().unwrap()),
+                }),
+            };
+            for status in [
+                SlotStatus::CreatedBank,
+                SlotStatus::Processed,
+                SlotStatus::Confirmed,
+                SlotStatus::Rooted,
+            ] {
+                plugin.update_bank_status(10, Some(9), &status, 77).unwrap();
+            }
+            for status in [
+                SlotStatus::FirstShredReceived,
+                SlotStatus::Completed,
+                SlotStatus::Dead("dead".into()),
+            ] {
+                plugin.update_slot_status(10, Some(9), &status).unwrap();
+            }
+            let mut direct = Vec::new();
+            while let Ok(message) = grpc_rx.try_recv() {
+                direct.push(message);
+            }
+            assert_eq!(direct.len(), if full_path { 4 } else { 7 });
+            let mut reconstructed = Vec::new();
+            while let Ok(message) = reconstruction_rx.try_recv() {
+                let BlockReconstructionMessage::Single(message) = message else {
+                    panic!("expected status");
+                };
+                reconstructed.push(message);
+            }
+            assert_eq!(reconstructed.len(), if full_path { 3 } else { 0 });
+            for message in direct.iter().chain(&reconstructed) {
+                let Message::Slot(slot) = message else {
+                    panic!("expected slot");
+                };
+                if matches!(
+                    slot.status,
+                    crate::plugin::message::SlotStatus::CreatedBank
+                        | crate::plugin::message::SlotStatus::Processed
+                        | crate::plugin::message::SlotStatus::Confirmed
+                        | crate::plugin::message::SlotStatus::Finalized
+                ) {
+                    assert_eq!(slot.bank_id, Some(77));
+                } else {
+                    assert_eq!(slot.bank_id, None);
+                }
+            }
+            for _ in 0..7 {
+                assert!(deshred_rx.try_recv().is_ok());
+                assert!(blocks_meta_rx.try_recv().is_ok());
+            }
+            assert!(deshred_rx.try_recv().is_err());
+            assert!(blocks_meta_rx.try_recv().is_err());
+            for rx in [&mut confirmed_rx, &mut finalized_rx] {
+                let mut count = 0;
+                while let Ok(batch) = rx.try_recv() {
+                    count += batch.len();
+                }
+                assert_eq!(count, if full_path { 4 } else { 0 });
+            }
+
+            let key = Pubkey::new_unique();
+            let owner = Pubkey::new_unique();
+            let mut info = ReplicaAccountInfoV3 {
+                pubkey: key.as_ref(),
+                lamports: 1,
+                owner: owner.as_ref(),
+                executable: false,
+                rent_epoch: 0,
+                data: &[1, 2, 3],
+                write_version: 4,
+                txn: None,
+            };
+            plugin
+                .update_account_from_snapshot(ReplicaAccountInfoVersions::V0_0_3(&info), 10)
+                .unwrap();
+            let Message::Account(snapshot) = *snapshot_rx.try_recv().unwrap() else {
+                panic!("expected account");
+            };
+            assert!(snapshot.is_startup);
+            assert_eq!(snapshot.bank_id, None);
+            plugin
+                .update_account_for_bank(ReplicaAccountInfoVersions::V0_0_3(&info), 10, 77)
+                .unwrap();
+            assert_eq!(grpc_rx.try_recv().is_ok(), full_path);
+            if let Some(gates) = &plugin.inner.as_ref().unwrap().fast_path_gates {
+                let filter = Filter::new(
+                    &SubscribeRequest {
+                        accounts: HashMap::from([(
+                            "account".into(),
+                            SubscribeRequestFilterAccounts {
+                                account: vec![key.to_string()],
+                                ..Default::default()
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                    &FilterLimits::default(),
+                    &mut fixtures::filter_names(),
+                )
+                .unwrap();
+                gates.update_client(1, &filter);
+            }
+            plugin
+                .update_account_for_bank(ReplicaAccountInfoVersions::V0_0_3(&info), 10, 77)
+                .unwrap();
+            let Message::Account(account) = grpc_rx.try_recv().unwrap() else {
+                panic!("expected account");
+            };
+            assert_eq!(account.bank_id, Some(77));
+            assert_eq!(account.account.data.as_ref(), info.data);
+            assert!(account.account.pre_encoded.get().is_none());
+            info.owner = rejected_owner.as_ref();
+            plugin
+                .update_account_for_bank(ReplicaAccountInfoVersions::V0_0_3(&info), 10, 77)
+                .unwrap();
+            plugin
+                .update_account_from_snapshot(ReplicaAccountInfoVersions::V0_0_3(&info), 10)
+                .unwrap();
+            // Live updates ignore owner_reject in both modes; snapshot still applies it.
+            let Message::Account(account) = grpc_rx.try_recv().unwrap() else {
+                panic!("expected live account from rejected owner");
+            };
+            assert_eq!(account.account.pubkey, key);
+            assert_eq!(account.account.owner, rejected_owner);
+            assert_eq!(account.bank_id, Some(77));
+            assert!(!account.is_startup);
+            assert!(grpc_rx.try_recv().is_err());
+            assert!(snapshot_rx.try_recv().is_err());
+        }
+    }
 }
